@@ -593,6 +593,41 @@ async def handle_events(tg_user_id: str, args: str) -> str:
     return "\n".join(lines)
 
 
+async def handle_threads(tg_user_id: str, args: str) -> str:
+    if not staff.is_admin(tg_user_id):
+        return "🔒 Admin only."
+    # /threads             → all open threads
+    # /threads @user       → threads for one guest
+    # /threads <room>      → threads for guests in that room
+    sender_filter = None
+    arg = args.strip()
+    if arg:
+        if arg.startswith("@"):
+            target = store.get_staff_by_username(arg.lstrip("@"))
+            if target:
+                sender_filter = target["tg_user_id"]
+        else:
+            for r in store.list_active_rooms():
+                if r["room_number"] == arg:
+                    sender_filter = r["tg_user_id"]
+                    break
+    threads = store.list_open_topic_threads(channel="telegram_guest", sender_id=sender_filter)
+    if not threads:
+        return f"No open topic threads{(' for ' + arg) if arg else ''}."
+    import datetime
+    lines = [f"*Open guest threads* ({len(threads)})\n"]
+    for t in threads[:30]:
+        last = datetime.datetime.fromtimestamp(t["last_message_at"]).strftime("%H:%M:%S")
+        room = store.get_room_for_guest(t["sender_id"]) or {}
+        room_no = room.get("room_number", "?")
+        guest = room.get("guest_name", "?")
+        lines.append(
+            f"  `{t['issue_id'][:8]}` *{t['topic']}* — Room {room_no} ({guest}) "
+            f"→ {t.get('agent_name') or '?'}  · last {last}"
+        )
+    return "\n".join(lines)
+
+
 async def handle_search(tg_user_id: str, args: str) -> str:
     if not staff.is_admin(tg_user_id):
         return "🔒 Admin only."
@@ -842,4 +877,6 @@ async def dispatch(*, text: str, msg_from: dict, chat: dict) -> Optional[str]:
         return await handle_room_history(tg_user_id, args)
     if cmd in ("search", "find"):
         return await handle_search(tg_user_id, args)
+    if cmd in ("threads", "topics"):
+        return await handle_threads(tg_user_id, args)
     return None  # unknown command — caller decides whether to ignore

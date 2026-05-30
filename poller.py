@@ -180,7 +180,7 @@ async def _poll_once(
                         )
                         # Detect STATUS markers in raw body (before strip)
                         raw_body = c.get("body") or ""
-                        if "STATUS: done" in raw_body.lower() or "status: done" in raw_body.lower():
+                        if "status: done" in raw_body.lower() or "status: resolved" in raw_body.lower():
                             store.log_event(
                                 event_type="resolved",
                                 issue_id=issue_id,
@@ -188,6 +188,7 @@ async def _poll_once(
                                 actor_kind="agent",
                                 department=enriched.get("department"),
                             )
+                            store.close_topic_thread(issue_id)
                     except Exception as exc:
                         log.warning("event log failed: %s", exc)
                 except Exception as exc:

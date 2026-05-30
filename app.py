@@ -24,6 +24,7 @@ import classifier
 import commands
 import guest_commands
 import guest_profile
+import intent_split
 import memory as guest_mem
 import paperclip_client as pc
 import poller
@@ -744,23 +745,49 @@ async def _handle_guest_update(update: dict) -> JSONResponse:
     # Increment follow-up counter for next time
     store.kv_set(fu_key, str(follow_up_index + 1))
 
-    # Route to Paperclip (Guest Conversations project), classify + assign
-    result = await _route_guest_room_message(
-        room=room,
-        msg_from=msg_from,
-        text=text,
-        sentiment_info=sent,
-        follow_up_index=follow_up_index,
-    )
+    # Try splitting message into multiple parallel topic-clauses
+    clauses = intent_split.split_message(text)
+    results: list[dict[str, Any]] = []
+    assignees: list[str] = []
+    if len(clauses) >= 2:
+        # Multi-topic message — spawn one issue per distinct intent
+        await _admin_mirror(
+            f"🪓 *Multi-topic message detected* — splitting into {len(clauses)} parallel "
+            f"requests: {', '.join(t for t, _ in clauses)}"
+        )
+        for intent_label, clause_text in clauses:
+            r = await _route_guest_room_message(
+                room=room,
+                msg_from=msg_from,
+                text=clause_text,
+                sentiment_info=sent,
+                follow_up_index=follow_up_index,
+            )
+            results.append(r)
+            if r.get("assignee"):
+                assignees.append(r["assignee"])
+    else:
+        # Single topic — original path
+        r = await _route_guest_room_message(
+            room=room,
+            msg_from=msg_from,
+            text=text,
+            sentiment_info=sent,
+            follow_up_index=follow_up_index,
+        )
+        results.append(r)
+        if r.get("assignee"):
+            assignees.append(r["assignee"])
 
-    # Wake the assigned agent immediately (every message, not just first)
-    assignee = result.get("assignee") or result.get("assigned_agent")
-    if assignee:
+    # Wake all involved agents
+    for assignee in set(assignees):
         try:
             await pc.wake_agent(assignee, reason="guest_message")
             await _admin_mirror(f"⚡ {assignee} woken on demand.")
         except Exception as exc:
             log.warning("wake_agent(%s) failed: %s", assignee, exc)
+
+    result = results[0] if results else {}
 
     # Auto-escalate to GM if sentiment / repetition warrants it
     if sentiment.should_escalate_to_gm(sentiment=sent, follow_up_index=follow_up_index):
@@ -918,16 +945,18 @@ async def _route_guest_room_message(
         f"The guest's topic is {quick_intent}. Do not change these."
     )
 
-    # Thread continuity: same guest → same issue
-    existing_issue_id = store.get_issue_id("telegram_guest", tg_user_id)
-    if existing_issue_id:
+    # Per-topic threading: only append if there's an OPEN thread on the SAME topic
+    existing_thread = store.find_open_topic_thread(
+        channel="telegram_guest", sender_id=tg_user_id, topic=quick_intent
+    )
+    if existing_thread:
+        existing_issue_id = existing_thread["issue_id"]
         comment_body = (
-            f"{sender_name} (the guest in Room {room_no}) sent another message: "
-            f"\"{text}\"."
+            f"{sender_name} (the guest in Room {room_no}) sent another message about "
+            f"{quick_intent.replace('_',' ')}: \"{text}\"."
             + (f" {tone_note}" if tone_note else "")
             + "\n\nReply directly to the guest. "
-            f"Use their actual name ({sender_name}) and their actual room number ({room_no}) — "
-            f"do NOT invent any other name or room. Be brief, warm, and specific."
+            f"Use their actual name ({sender_name}) and their actual room number ({room_no})."
             + state_lock
         )
         await pc.add_comment(
@@ -936,7 +965,11 @@ async def _route_guest_room_message(
             author_kind="external",
             extra_metadata={"room": room_no, "sender": sender_name, "agent_name": None},
         )
-        # Wake the currently-assigned agent so the follow-up gets immediate attention
+        store.upsert_topic_thread(
+            channel="telegram_guest", sender_id=tg_user_id,
+            topic=quick_intent, issue_id=existing_issue_id,
+        )
+        # Wake the assigned agent
         try:
             issue_full = await pc.get_issue(existing_issue_id)
             aid = issue_full.get("assigneeAgentId")
@@ -949,10 +982,11 @@ async def _route_guest_room_message(
         except Exception as exc:
             log.warning("wake on follow-up failed: %s", exc)
         await _admin_mirror(
-            f"📌 *Pipeline* — appended to thread `{existing_issue_id[:8]}` for Room {room_no}. "
-            f"Assignee woken; reply incoming in ~10–30 sec."
+            f"📌 *Same-topic follow-up* — appended to thread `{existing_issue_id[:8]}` "
+            f"(topic: {quick_intent}) for Room {room_no}."
         )
         return {"issue_id": existing_issue_id, "created": False}
+    # Different topic → fall through to create a NEW issue
 
     # Log inbound guest message
     store.log_event(
@@ -1020,6 +1054,11 @@ async def _route_guest_room_message(
     issue_id = str(issue.get("id") or "")
     if issue_id:
         store.set_issue_id("telegram_guest", tg_user_id, issue_id)
+        # Register this issue as the open thread for THIS topic
+        store.upsert_topic_thread(
+            channel="telegram_guest", sender_id=tg_user_id,
+            topic=intent, issue_id=issue_id, agent_name=assignee,
+        )
         store.log_event(
             event_type="created",
             issue_id=issue_id,

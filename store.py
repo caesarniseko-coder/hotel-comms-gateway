@@ -101,6 +101,22 @@ CREATE TRIGGER IF NOT EXISTS workflow_events_ai AFTER INSERT ON workflow_events 
             COALESCE(new.payload, ''));
 END;
 
+-- Per-topic open threads — same guest can have parallel issues, one per topic
+CREATE TABLE IF NOT EXISTS guest_topic_threads (
+    channel        TEXT NOT NULL,
+    sender_id      TEXT NOT NULL,
+    topic          TEXT NOT NULL,
+    issue_id       TEXT NOT NULL,
+    status         TEXT NOT NULL DEFAULT 'open',
+    agent_name     TEXT,
+    created_at     INTEGER NOT NULL,
+    last_message_at INTEGER NOT NULL,
+    closed_at      INTEGER,
+    PRIMARY KEY (channel, sender_id, topic, issue_id)
+);
+CREATE INDEX IF NOT EXISTS idx_topic_threads_open ON guest_topic_threads(channel, sender_id, topic) WHERE status='open';
+CREATE INDEX IF NOT EXISTS idx_topic_threads_issue ON guest_topic_threads(issue_id);
+
 -- Cross-stay guest memory (keyed by tg_user_id)
 CREATE TABLE IF NOT EXISTS guest_memory (
     tg_user_id     TEXT PRIMARY KEY,
@@ -398,6 +414,91 @@ def list_active_rooms() -> list[dict]:
     with _conn() as c:
         rows = c.execute(
             "SELECT * FROM room_assignments WHERE check_out_at IS NULL ORDER BY check_in_at DESC"
+        ).fetchall()
+        return [dict(r) for r in rows]
+
+
+# ---- per-topic threads (parallel issues per guest) -------------------------
+
+# Threads older than this and not heard from are considered stale → new issue
+TOPIC_THREAD_FRESHNESS_SECONDS = 30 * 60  # 30 minutes
+
+
+def find_open_topic_thread(
+    channel: str,
+    sender_id: str,
+    topic: str,
+) -> Optional[dict]:
+    """Return the most-recent OPEN thread for (channel, sender, topic), if fresh."""
+    cutoff = int(time.time()) - TOPIC_THREAD_FRESHNESS_SECONDS
+    with _conn() as c:
+        row = c.execute(
+            "SELECT * FROM guest_topic_threads "
+            "WHERE channel=? AND sender_id=? AND topic=? AND status='open' "
+            "AND last_message_at >= ? "
+            "ORDER BY last_message_at DESC LIMIT 1",
+            (channel, sender_id, topic, cutoff),
+        ).fetchone()
+        return dict(row) if row else None
+
+
+def upsert_topic_thread(
+    *,
+    channel: str,
+    sender_id: str,
+    topic: str,
+    issue_id: str,
+    agent_name: Optional[str] = None,
+) -> dict:
+    now = int(time.time())
+    with _conn() as c:
+        existing = c.execute(
+            "SELECT * FROM guest_topic_threads WHERE channel=? AND sender_id=? AND topic=? AND issue_id=?",
+            (channel, sender_id, topic, issue_id),
+        ).fetchone()
+        if existing:
+            c.execute(
+                "UPDATE guest_topic_threads SET last_message_at=?, agent_name=COALESCE(?, agent_name) "
+                "WHERE channel=? AND sender_id=? AND topic=? AND issue_id=?",
+                (now, agent_name, channel, sender_id, topic, issue_id),
+            )
+        else:
+            c.execute(
+                "INSERT INTO guest_topic_threads(channel, sender_id, topic, issue_id, status, "
+                "agent_name, created_at, last_message_at) VALUES (?, ?, ?, ?, 'open', ?, ?, ?)",
+                (channel, sender_id, topic, issue_id, agent_name, now, now),
+            )
+        row = c.execute(
+            "SELECT * FROM guest_topic_threads WHERE channel=? AND sender_id=? AND topic=? AND issue_id=?",
+            (channel, sender_id, topic, issue_id),
+        ).fetchone()
+        return dict(row)
+
+
+def close_topic_thread(issue_id: str) -> None:
+    now = int(time.time())
+    with _conn() as c:
+        c.execute(
+            "UPDATE guest_topic_threads SET status='closed', closed_at=? WHERE issue_id=?",
+            (now, issue_id),
+        )
+
+
+def list_open_topic_threads(
+    channel: Optional[str] = None,
+    sender_id: Optional[str] = None,
+) -> list[dict]:
+    where = ["status='open'"]
+    args: list = []
+    if channel:
+        where.append("channel=?"); args.append(channel)
+    if sender_id:
+        where.append("sender_id=?"); args.append(sender_id)
+    where_clause = " AND ".join(where)
+    with _conn() as c:
+        rows = c.execute(
+            f"SELECT * FROM guest_topic_threads WHERE {where_clause} ORDER BY last_message_at DESC",
+            args,
         ).fetchall()
         return [dict(r) for r in rows]
 
