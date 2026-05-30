@@ -168,6 +168,17 @@ async def reassign_issue(issue_id: str, agent_name: str) -> dict[str, Any]:
     return await update_issue(issue_id, {"assigneeAgentId": aid})
 
 
+async def wake_agent(agent_name: str, reason: str = "external_trigger") -> dict[str, Any]:
+    """POST /api/agents/{id}/wakeup so the agent runs NOW instead of waiting."""
+    aid = await slug_to_id(agent_name)
+    return await _request(
+        "POST",
+        f"/api/agents/{aid}/wakeup",
+        params={"companyId": COMPANY_ID},
+        json_body={"reason": reason},
+    )
+
+
 # ---- project lookup ---------------------------------------------------------
 
 _projects_cache: dict[str, str] = {}

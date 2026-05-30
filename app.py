@@ -53,11 +53,20 @@ def _strip_meta(text: str) -> str:
     return _META_RE.sub("", text or "").strip()
 
 
+_FIELD_LEAK_RE = re.compile(
+    r"^\s*\*\*(Channel|Room|Guest|Intent|Guest profile|Source|Reporter|Speaker|Routed to|Owner|Date|Department|Handoff from)\*\*:.*$",
+    re.MULTILINE | re.IGNORECASE,
+)
+
+
 def _strip_for_guest(text: str) -> str:
     """Remove internal workflow markers before relaying to a real human channel."""
     t = _strip_meta(text or "")
     t = _STATUS_RE.sub("", t)
     t = _HANDOFF_LINE_RE.sub("", t)
+    t = _FIELD_LEAK_RE.sub("", t)
+    # Drop a leading `---` separator the agent sometimes echoes
+    t = re.sub(r"^\s*---\s*$", "", t, flags=re.MULTILINE)
     # Collapse multiple blank lines
     t = re.sub(r"\n{3,}", "\n\n", t).strip()
     return t
@@ -620,6 +629,18 @@ async def _handle_guest_update(update: dict) -> JSONResponse:
         )
         return JSONResponse({"ok": True, "handled": "checkin_prompt"})
 
+    # Send IMMEDIATE acknowledgement to guest so they know we received it
+    try:
+        await GUEST_BOT.send(
+            to=parsed["to"],
+            text=(
+                "Got it — our team is on this now. I'll be back to you within "
+                "a minute. 🛎"
+            ),
+        )
+    except Exception as exc:
+        log.warning("guest ack failed: %s", exc)
+
     # Mirror inbound to admin with profile snippet for context
     profile_line = ""
     if room.get("profile_json"):
@@ -627,7 +648,7 @@ async def _handle_guest_update(update: dict) -> JSONResponse:
             p = json.loads(room["profile_json"])
             profile_line = (
                 f" — {p.get('loyalty_tier')} tier, {p.get('segment')}, "
-                f"night {1 + (0 if not p.get('check_in') else 0)} of {p.get('nights')}"
+                f"night 1 of {p.get('nights')}"
             )
         except Exception:
             pass
@@ -641,6 +662,16 @@ async def _handle_guest_update(update: dict) -> JSONResponse:
         msg_from=msg_from,
         text=text,
     )
+
+    # Wake the assigned agent immediately so we don't wait 5+ min for heartbeat
+    assignee = result.get("assignee")
+    if assignee:
+        try:
+            await pc.wake_agent(assignee, reason="guest_message")
+            await _admin_mirror(f"⚡ {assignee} woken on demand (no waiting for heartbeat).")
+        except Exception as exc:
+            log.warning("wake_agent(%s) failed: %s", assignee, exc)
+
     return JSONResponse({"ok": True, "handled": "guest_message", **result})
 
 
