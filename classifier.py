@@ -64,9 +64,11 @@ async def classify(text: str) -> tuple[str, str, str | None]:
         "temperature": 0.0,
         "max_tokens": 16,
     }
+    base = GATEWAY_BASE_URL
+    path = "/chat/completions" if base.rstrip("/").endswith("/v1") else "/v1/chat/completions"
     async with httpx.AsyncClient(timeout=30.0) as client:
         r = await client.post(
-            f"{GATEWAY_BASE_URL}/v1/chat/completions",
+            f"{base}{path}",
             headers={
                 "Authorization": f"Bearer {GATEWAY_API_KEY}",
                 "Content-Type": "application/json",

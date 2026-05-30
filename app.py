@@ -5,7 +5,9 @@ Bridges Telegram / Email / Slack / Web ↔ Paperclip ↔ Grand Hotel agents.
 from __future__ import annotations
 
 import asyncio
+import json
 import os
+import re
 import time
 from collections import defaultdict, deque
 from typing import Any
@@ -17,6 +19,24 @@ from adapters import telegram, email_brevo, slack, web
 import classifier
 import paperclip_client as pc
 import store
+
+_META_RE = re.compile(r"<!--\s*comms-meta:\s*(\{.*?\})\s*-->", re.DOTALL)
+
+
+def _extract_meta(text: str) -> dict[str, Any]:
+    if not text:
+        return {}
+    m = _META_RE.search(text)
+    if not m:
+        return {}
+    try:
+        return json.loads(m.group(1))
+    except Exception:
+        return {}
+
+
+def _strip_meta(text: str) -> str:
+    return _META_RE.sub("", text or "").strip()
 
 GUEST_PROJECT_ID = os.environ["PAPERCLIP_GUEST_PROJECT_ID"]
 STAFF_PROJECT_ID = os.environ.get("PAPERCLIP_STAFF_PROJECT_ID", GUEST_PROJECT_ID)
@@ -232,9 +252,11 @@ async def paperclip_webhook(request: Request) -> dict[str, Any]:
         return {"ok": True, "duplicate": True}
 
     metadata = issue.get("metadata") or {}
+    if not metadata:
+        metadata = _extract_meta(issue.get("description") or "")
     channel = (metadata.get("channel") or "").lower()
     to = metadata.get("to") or ""
-    body = comment.get("body") or ""
+    body = _strip_meta(comment.get("body") or "")
     if not channel or not to or not body:
         return {"ok": True, "skipped": True, "reason": "missing metadata"}
 
