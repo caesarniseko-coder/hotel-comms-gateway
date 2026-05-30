@@ -25,18 +25,19 @@ LABELS = [
     "complaint_escalate",
 ]
 
-# Intent -> hotel agent slug
+# Intent -> hotel agent NAME (must match Paperclip's stored agent.name exactly).
+# Paperclip's agent list API exposes `name` but not `urlKey`/slug, so we route by name.
 ROUTE = {
-    "reservations": "reservations-mgr",
-    "front_office": "front-office-mgr",
-    "concierge": "concierge",
-    "f_and_b": "restaurant-mgr",
-    "housekeeping": "executive-housekeeper",
-    "maintenance": "chief-engineer",
-    "billing": "dof",
-    "spa": "spa-mgr",
-    "security": "security-mgr",
-    "complaint_escalate": "gm",
+    "reservations": "Reservations Mgr",
+    "front_office": "Front Office Mgr",
+    "concierge": "Concierge",
+    "f_and_b": "Restaurant Mgr",
+    "housekeeping": "Executive Housekeeper",
+    "maintenance": "Chief Engineer",
+    "billing": "DOF",
+    "spa": "Spa Mgr",
+    "security": "Security Mgr",
+    "complaint_escalate": "GM",
 }
 
 PRIORITY = {"complaint_escalate": "high", "security": "high"}

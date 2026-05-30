@@ -57,25 +57,25 @@ async def _request(
     raise RuntimeError(f"paperclip {method} {path} retries exhausted")
 
 
-async def _agents_by_slug() -> dict[str, str]:
+async def _agents_by_name() -> dict[str, str]:
+    """Map agent.name → agent.id."""
     async with _agents.lock:
         if _agents.map:
             return _agents.map
         data = await _request("GET", f"/api/companies/{COMPANY_ID}/agents")
-        # response is a list of agents; each has id + slug
         items = data if isinstance(data, list) else data.get("items") or data.get("agents") or []
-        _agents.map = {a["slug"]: a["id"] for a in items if a.get("slug") and a.get("id")}
+        _agents.map = {a["name"]: a["id"] for a in items if a.get("name") and a.get("id")}
         return _agents.map
 
 
 async def slug_to_id(slug: str) -> str:
-    m = await _agents_by_slug()
+    """Despite the legacy parameter name, this looks up by Paperclip agent.name."""
+    m = await _agents_by_name()
     aid = m.get(slug)
     if not aid:
-        # refresh once in case a new agent was added
         async with _agents.lock:
             _agents.map = {}
-        m = await _agents_by_slug()
+        m = await _agents_by_name()
         aid = m.get(slug)
     if not aid:
         raise KeyError(f"unknown agent slug: {slug}")
