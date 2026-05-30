@@ -1,13 +1,16 @@
 """Intent classifier — one short call to qwen3:8b-fast via the self-hosted LLM gateway."""
 from __future__ import annotations
 
+import logging
 import os
 import re
 import httpx
 
-GATEWAY_BASE_URL = os.environ["GATEWAY_BASE_URL"].rstrip("/")
-GATEWAY_API_KEY = os.environ["GATEWAY_API_KEY_CLASSIFIER"]
+GATEWAY_BASE_URL = os.environ.get("GATEWAY_BASE_URL", "").rstrip("/")
+GATEWAY_API_KEY = os.environ.get("GATEWAY_API_KEY_CLASSIFIER", "")
 CLASSIFIER_MODEL = os.environ.get("CLASSIFIER_MODEL", "qwen3:8b-fast")
+
+log = logging.getLogger("classifier")
 
 LABELS = [
     "reservations",
@@ -54,7 +57,10 @@ _LABEL_RE = re.compile(r"\b(" + "|".join(LABELS) + r")\b", re.I)
 
 
 async def classify(text: str) -> tuple[str, str, str | None]:
-    """Return (intent, assignee_slug, priority_or_None)."""
+    """Return (intent, assignee_slug, priority_or_None). Defaults to concierge on any failure."""
+    if not GATEWAY_BASE_URL or not GATEWAY_API_KEY:
+        log.info("classifier disabled (no gateway creds) — defaulting to concierge")
+        return "concierge", ROUTE["concierge"], None
     body = {
         "model": CLASSIFIER_MODEL,
         "messages": [
@@ -66,17 +72,21 @@ async def classify(text: str) -> tuple[str, str, str | None]:
     }
     base = GATEWAY_BASE_URL
     path = "/chat/completions" if base.rstrip("/").endswith("/v1") else "/v1/chat/completions"
-    async with httpx.AsyncClient(timeout=30.0) as client:
-        r = await client.post(
-            f"{base}{path}",
-            headers={
-                "Authorization": f"Bearer {GATEWAY_API_KEY}",
-                "Content-Type": "application/json",
-            },
-            json=body,
-        )
-        r.raise_for_status()
-        content = r.json()["choices"][0]["message"]["content"] or ""
+    try:
+        async with httpx.AsyncClient(timeout=30.0) as client:
+            r = await client.post(
+                f"{base}{path}",
+                headers={
+                    "Authorization": f"Bearer {GATEWAY_API_KEY}",
+                    "Content-Type": "application/json",
+                },
+                json=body,
+            )
+            r.raise_for_status()
+            content = r.json()["choices"][0]["message"]["content"] or ""
+    except Exception as exc:
+        log.warning("classifier call failed (%s) — defaulting to concierge", exc)
+        return "concierge", ROUTE["concierge"], None
 
     m = _LABEL_RE.search(content.lower())
     intent = m.group(1).lower() if m else "concierge"
