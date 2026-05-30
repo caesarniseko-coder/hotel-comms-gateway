@@ -427,25 +427,38 @@ async def handle_status(tg_user_id: str, chat: dict) -> str:
 
 
 async def handle_start_day(tg_user_id: str, args: str) -> str:
+    import asyncio as _asyncio
     if not staff.is_admin(tg_user_id):
         return "🔒 Admin only."
-    # Make sure standing seeds exist
-    seed_result = await autonomy.seed_day(force=False)
-    started = await world.start_day()
-    s = world.get_state()
-    if started.get("already_running"):
+    if world.is_running():
+        s = world.get_state()
         return (
             f"☀️ The day is already running.\n"
             f"World clock: {s['world_hour']:02d}:{s['world_minute']:02d}, "
             f"occupancy {int(s['occupancy']*100)}%, ADR ${s['adr']:.0f}.\n"
-            f"Use /stop_day to halt or /world to inspect."
+            f"/stop_day to halt or /world to inspect."
         )
+
+    # Fire-and-forget: start the driver and seed in background so the webhook
+    # response lands within Telegram's timeout.
+    async def _bg():
+        try:
+            await autonomy.seed_day(force=False)
+        except Exception:
+            log.exception("seed_day in background failed")
+        try:
+            await world.start_day()
+        except Exception:
+            log.exception("world.start_day in background failed")
+
+    _asyncio.create_task(_bg())
     return (
-        f"🌅 *Operating day STARTED*\n"
-        f"World tick: every {started.get('tick_seconds')}s (real) = +30 min world time.\n"
-        f"Synthetic events will start firing into your agents' issues. "
-        f"You'll see pulses cascading into this chat as agents react.\n\n"
-        f"Run /stop_day to halt. /world to inspect current state."
+        "🌅 Operating day STARTING…\n"
+        "Seeding standing tasks + starting the world driver in the background. "
+        "Synthetic events will begin firing in ~30 sec. Agent pulses will cascade "
+        "into this chat over the next 5–15 minutes.\n\n"
+        "/world to inspect current state.\n"
+        "/stop_day to halt."
     )
 
 
