@@ -55,16 +55,17 @@ async def send(
     text: str,
     reply_to_message_id: Optional[int] = None,
     message_thread_id: Optional[int] = None,
-    parse_mode: str = "Markdown",
+    parse_mode: str = "",
 ) -> dict[str, Any]:
     if not TG_BOT_TOKEN:
         return {"skipped": True}
     payload: dict[str, Any] = {
         "chat_id": to,
         "text": text[:4096],
-        "parse_mode": parse_mode,
         "disable_web_page_preview": True,
     }
+    if parse_mode:
+        payload["parse_mode"] = parse_mode
     if reply_to_message_id:
         payload["reply_to_message_id"] = reply_to_message_id
     if message_thread_id:
@@ -82,8 +83,8 @@ async def send(
         except Exception:
             pass
 
-        # If markdown parse failure, retry plain text
-        if r.status_code == 400 and parse_mode and ("parse" in body.lower() or "entit" in body.lower() or "bytes" in body.lower()):
+        # Any 400 with parse_mode set → retry plain
+        if r.status_code == 400 and "parse_mode" in payload:
             payload.pop("parse_mode", None)
             r2 = await client.post(f"{TG_API}/sendMessage", json=payload)
             if r2.status_code == 200:

@@ -56,6 +56,19 @@ app = FastAPI(title="Hotel Comms Gateway")
 
 _poller_task: asyncio.Task | None = None
 _bot_username: str | None = None
+_last_errors: deque[dict] = deque(maxlen=20)
+_last_updates: deque[dict] = deque(maxlen=20)
+
+
+def _record_error(stage: str, exc: Exception) -> None:
+    import traceback
+    _last_errors.append({
+        "ts": int(time.time()),
+        "stage": stage,
+        "error": type(exc).__name__,
+        "detail": str(exc)[:600],
+        "tb": traceback.format_exc().splitlines()[-8:],
+    })
 
 # In-memory queue keyed by sessionId for the web channel /api/web/poll.
 _web_inbox: dict[str, deque[str]] = defaultdict(deque)
@@ -138,6 +151,28 @@ async def root() -> dict[str, Any]:
 @app.get("/health")
 async def health() -> dict[str, Any]:
     return {"ok": True, "ts": int(time.time())}
+
+
+@app.get("/debug/errors")
+async def debug_errors() -> dict[str, Any]:
+    return {"errors": list(_last_errors), "bot": _bot_username}
+
+
+@app.get("/debug/updates")
+async def debug_updates() -> dict[str, Any]:
+    return {"updates": list(_last_updates)}
+
+
+@app.post("/debug/send")
+async def debug_send(request: Request) -> dict[str, Any]:
+    """Send a test message — POST {chat_id, text}"""
+    payload = await request.json()
+    try:
+        r = await telegram.send(to=str(payload["chat_id"]), text=payload.get("text", "ping"))
+        return {"ok": True, "telegram_response": r}
+    except Exception as exc:
+        _record_error("debug_send", exc)
+        return {"ok": False, "error": type(exc).__name__, "detail": str(exc)[:500]}
 
 
 # ---------------------------------------------------------------------------
@@ -276,12 +311,14 @@ async def telegram_webhook(
     if TG_SECRET and x_telegram_bot_api_secret_token != TG_SECRET:
         raise HTTPException(status_code=401, detail="bad telegram secret")
     try:
-        return await _handle_telegram_update(await request.json())
+        update = await request.json()
+        _last_updates.append({"ts": int(time.time()), "update": update})
+        return await _handle_telegram_update(update)
     except Exception as exc:
         import traceback
         tb = traceback.format_exc()
         log.exception("telegram webhook failed: %s", exc)
-        # Return 200 so Telegram doesn't retry — but expose error for debugging
+        _record_error("telegram_webhook", exc)
         return JSONResponse({
             "ok": False,
             "error": type(exc).__name__,
