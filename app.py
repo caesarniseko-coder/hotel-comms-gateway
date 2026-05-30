@@ -53,8 +53,9 @@ def _strip_meta(text: str) -> str:
     return _META_RE.sub("", text or "").strip()
 
 
+# Strip field labels — both `**Word**:` and `**Word:**` variants
 _FIELD_LEAK_RE = re.compile(
-    r"^\s*\*\*(Channel|Room|Guest|Intent|Guest profile|Source|Reporter|Speaker|Routed to|Owner|Date|Department|Handoff from)\*\*:.*$",
+    r"^\s*\*\*\s*(Channel|Room|Guest|Intent|Guest profile|Source|Reporter|Speaker|Routed to|Owner|Date|Department|Handoff from|From|Asking|To|Subject|Priority)\s*:?\s*\*\*\s*:?\s*.*$",
     re.MULTILINE | re.IGNORECASE,
 )
 
@@ -129,7 +130,22 @@ async def _dispatch_to_channel(channel: str, to: str, body: str) -> None:
         room = store.get_room_for_guest(to) or {}
         room_label = f"Room {room.get('room_number')}" if room.get("room_number") else f"tg:{to}"
         guest_name = room.get("guest_name") or "guest"
-        await _admin_mirror(f"🛏 {room_label} ({guest_name}) ← Concierge:\n{clean[:1200]}")
+        # Look up the actual agent name from the most recent thread issue
+        agent_label = "Agent"
+        try:
+            issue_id = store.get_issue_id("telegram_guest", to)
+            if issue_id:
+                issue = await pc.get_issue(issue_id)
+                aid = issue.get("assigneeAgentId")
+                if aid:
+                    name_map = await pc._agents_by_name()
+                    for n, idv in name_map.items():
+                        if idv == aid:
+                            agent_label = n
+                            break
+        except Exception:
+            pass
+        await _admin_mirror(f"🛏 {room_label} ({guest_name}) ← {agent_label}:\n{clean[:1200]}")
     elif channel == "email":
         await email_brevo.send(to=to, text=_strip_for_guest(body))
     elif channel == "slack":
