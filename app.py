@@ -96,24 +96,93 @@ async def _dispatch_to_channel(channel: str, to: str, body: str) -> None:
 
 async def _dispatch_workspace(origin: dict, body: str) -> None:
     """Relay an agent comment from a workspace issue back to staff."""
-    chat_id = origin.get("tg_chat_id")
-    if not chat_id:
-        return
-    # Prefix with a context line so staff know what's happening
     dept = origin.get("department")
     label = staff.dept_label(dept) if dept else "Manager"
-    prefix = f"💬 *{label} →*\n"
-    await telegram.send(to=str(chat_id), text=prefix + body)
+    agent = origin.get("agent_name") or label
+    prefix = f"💬 {agent} →\n"
 
-    # If the issue originated from a staff member's DM (not a group), also
-    # post in the dept group for visibility.
-    if origin.get("origin_kind") == "staff_report" and dept:
-        group_chat = store.get_chat_for_dept(dept)
-        if group_chat and str(group_chat) != str(chat_id):
-            try:
-                await telegram.send(to=str(group_chat), text=prefix + body)
-            except Exception as exc:
-                log.warning("workspace dispatch: dept group post failed: %s", exc)
+    # Set of recipients (deduplicated)
+    targets: set[str] = set()
+    if origin.get("tg_chat_id"):
+        targets.add(str(origin["tg_chat_id"]))
+
+    # Bound dept group
+    if dept:
+        bound = store.get_chat_for_dept(dept)
+        if bound:
+            targets.add(str(bound))
+
+    # Admin DM — always fan out, so the user sees the workspace even without groups
+    admin_id = staff.admin_user_id()
+    if admin_id:
+        targets.add(str(admin_id))
+
+    # Handoff parsing — for autonomous cross-agent flow
+    await _process_handoffs(origin=origin, body=body)
+
+    for chat in targets:
+        try:
+            await telegram.send(to=chat, text=prefix + body)
+        except Exception as exc:
+            log.warning("workspace dispatch: post to %s failed: %s", chat, exc)
+
+
+_HANDOFF_RE = re.compile(r"@HANDOFF:\s*([A-Za-z &\-]+)", re.IGNORECASE)
+
+
+async def _process_handoffs(*, origin: dict, body: str) -> None:
+    """If an agent's reply contains `@HANDOFF: <Department>`, create a child issue."""
+    matches = _HANDOFF_RE.findall(body or "")
+    if not matches:
+        return
+    seen_targets: set[str] = set()
+    for raw in matches:
+        target_norm = raw.strip().lower()
+        # Map the natural-language target → a dept slug we know
+        target_dept = None
+        for dept_slug in staff.ALL_DEPTS:
+            if dept_slug in target_norm or staff.dept_label(dept_slug).lower() in target_norm:
+                target_dept = dept_slug
+                break
+        if not target_dept:
+            continue
+        if target_dept in seen_targets:
+            continue
+        seen_targets.add(target_dept)
+        agent_name = staff.dept_agent_for(target_dept)
+        if not agent_name:
+            continue
+        parent_issue_id = (origin or {}).get("issue_id") or "?"
+        try:
+            child = await pc.create_issue(
+                project_id=STAFF_PROJECT_ID,
+                title=f"[handoff] → {agent_name}: {(body[:60] or '').strip()}",
+                body=(
+                    f"**Handoff from:** {origin.get('agent_name') or 'a colleague'}\n"
+                    f"**Source issue:** `{parent_issue_id[:8]}`\n"
+                    f"**Department:** {staff.dept_label(target_dept)}\n\n"
+                    f"---\n\n{body}"
+                ),
+                assignee_slug=agent_name,
+                channel="telegram_staff",
+                to=str(origin.get("tg_chat_id") or staff.admin_user_id() or "0"),
+                extra_metadata={
+                    "handoff_from_issue": parent_issue_id,
+                    "handoff_dept": target_dept,
+                    "agent_name": agent_name,
+                },
+            )
+            child_id = str(child.get("id") or "")
+            if child_id:
+                store.set_issue_origin(
+                    issue_id=child_id,
+                    origin_kind="handoff",
+                    tg_chat_id=str(origin.get("tg_chat_id") or "") or None,
+                    tg_user_id=None,
+                    department=target_dept,
+                )
+        except Exception as exc:
+            log.warning("handoff to %s failed: %s", target_dept, exc)
 
 
 @app.on_event("startup")

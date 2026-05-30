@@ -10,6 +10,7 @@ import os
 from typing import Any, Optional
 
 from adapters import telegram as tg
+import autonomy
 import paperclip_client as pc
 import staff
 import store
@@ -85,7 +86,8 @@ async def handle_help() -> str:
         "• `/ask <Agent> <question>` — ping a manager (GM, DOR, Chief Engineer…)\n\n"
         "*Group setup* (admin)\n"
         "• `/dept <slug>` — bind this Telegram group to a department\n"
-        "• `/register @user <role>` — assign a role to a colleague"
+        "• `/register @user <role>` — assign a role to a colleague\n"
+        "• `/seed_day` — kick off today's autonomous ops cycle"
     )
 
 
@@ -419,6 +421,24 @@ async def handle_status(tg_user_id: str, chat: dict) -> str:
     return "\n".join(lines)
 
 
+async def handle_seed_day(tg_user_id: str, args: str) -> str:
+    if not staff.is_admin(tg_user_id):
+        return "🔒 Admin only."
+    force = "force" in args.lower()
+    result = await autonomy.seed_day(force=force)
+    if result.get("skipped"):
+        return (
+            "📅 Already seeded for today. Use `/seed_day force` to re-create the "
+            "standing issues anyway."
+        )
+    n_ok = sum(1 for c in result.get("created", []) if "issue_id" in c and c["issue_id"])
+    return (
+        f"🌅 *Day seeded* — {n_ok} standing issues created across HODs.\n"
+        f"Agents will pick them up on their heartbeats and start posting "
+        f"operational pulses into this chat. Watch the next ~5-15 min."
+    )
+
+
 async def handle_register(tg_user_id: str, args: str) -> str:
     if not staff.is_admin(tg_user_id):
         return "🔒 Admin only."
@@ -481,4 +501,6 @@ async def dispatch(*, text: str, msg_from: dict, chat: dict) -> Optional[str]:
         return await handle_status(tg_user_id, chat)
     if cmd == "register":
         return await handle_register(tg_user_id, args)
+    if cmd in ("seed_day", "seedday", "seed"):
+        return await handle_seed_day(tg_user_id, args)
     return None  # unknown command — caller decides whether to ignore

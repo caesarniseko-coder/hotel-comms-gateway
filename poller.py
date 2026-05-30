@@ -115,11 +115,12 @@ async def _poll_once(
                 new_high = ts
         _high_water[key] = new_high
 
-    # 2) Workspace issues (staff-originated)
+    # 2) Workspace issues (staff-originated or autonomous)
     if send_workspace is not None:
         origins = store.list_issue_origins(since_days=SESSION_TTL_DAYS)
         for o in origins:
-            if o["origin_kind"] not in ("staff_report", "staff_dm", "staff_group", "ask"):
+            kind = o["origin_kind"]
+            if kind not in ("staff_report", "staff_dm", "staff_group", "ask", "handoff", "autonomy"):
                 continue
             issue_id = o["issue_id"]
             try:
@@ -130,6 +131,19 @@ async def _poll_once(
             comments = issue.get("comments") or []
             if not comments:
                 comments = await _fetch_comments(issue_id)
+            # Resolve agent name for prefix labelling
+            assignee_id = issue.get("assigneeAgentId")
+            agent_name = None
+            if assignee_id:
+                try:
+                    name_map = await pc._agents_by_name()
+                    for n, aid in name_map.items():
+                        if aid == assignee_id:
+                            agent_name = n
+                            break
+                except Exception:
+                    pass
+            enriched = {**o, "issue_id": issue_id, "agent_name": agent_name}
             key = ("ws", issue_id)
             watermark = _high_water.get(key, 0)
             new_high = watermark
@@ -141,7 +155,7 @@ async def _poll_once(
                 if not body:
                     continue
                 try:
-                    await send_workspace(o, body)
+                    await send_workspace(enriched, body)
                     dispatched += 1
                 except Exception as exc:
                     log.warning("poller: workspace dispatch failed for issue %s: %s", issue_id, exc)
