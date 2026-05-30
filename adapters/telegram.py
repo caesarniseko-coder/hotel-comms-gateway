@@ -25,10 +25,18 @@ _TIMEOUT = httpx.Timeout(connect=20.0, read=20.0, write=10.0, pool=15.0)
 
 
 class TgBot:
-    def __init__(self, *, name: str, token: str, secret: str = "") -> None:
+    def __init__(self, *, name: str, token_env: str, secret_env: str = "") -> None:
         self.name = name
-        self.token = token
-        self.secret = secret  # the secret_token we required Telegram to send back
+        self._token_env = token_env
+        self._secret_env = secret_env
+
+    @property
+    def token(self) -> str:
+        return os.environ.get(self._token_env, "")
+
+    @property
+    def secret(self) -> str:
+        return os.environ.get(self._secret_env, "")
 
     @property
     def configured(self) -> bool:
@@ -36,7 +44,13 @@ class TgBot:
 
     @property
     def api(self) -> str:
-        return f"{_API_ROOT}/bot{self.token}"
+        api_root = (os.environ.get("TG_RELAY_URL") or "https://api.telegram.org").rstrip("/")
+        return f"{api_root}/bot{self.token}"
+
+    @staticmethod
+    def _relay_headers() -> dict[str, str]:
+        s = os.environ.get("TG_RELAY_SECRET", "")
+        return {"X-Relay-Secret": s} if s else {}
 
     async def send(
         self,
@@ -59,7 +73,7 @@ class TgBot:
         if message_thread_id:
             payload["message_thread_id"] = message_thread_id
 
-        async with httpx.AsyncClient(timeout=_TIMEOUT, headers=_RELAY_HEADERS) as client:
+        async with httpx.AsyncClient(timeout=_TIMEOUT, headers=self._relay_headers()) as client:
             r = await client.post(f"{self.api}/sendMessage", json=payload)
             if r.status_code == 200:
                 return r.json()
@@ -80,7 +94,7 @@ class TgBot:
     async def get_me(self) -> dict[str, Any]:
         if not self.configured:
             return {}
-        async with httpx.AsyncClient(timeout=_TIMEOUT, headers=_RELAY_HEADERS) as client:
+        async with httpx.AsyncClient(timeout=_TIMEOUT, headers=self._relay_headers()) as client:
             r = await client.get(f"{self.api}/getMe")
             r.raise_for_status()
             return r.json().get("result", {})
@@ -92,7 +106,7 @@ class TgBot:
         secret_token: str,
         allowed_updates: list[str] | None = None,
     ) -> dict[str, Any]:
-        async with httpx.AsyncClient(timeout=_TIMEOUT, headers=_RELAY_HEADERS) as client:
+        async with httpx.AsyncClient(timeout=_TIMEOUT, headers=self._relay_headers()) as client:
             r = await client.post(
                 f"{self.api}/setWebhook",
                 json={
@@ -106,17 +120,9 @@ class TgBot:
             return r.json()
 
 
-# Singleton instances
-STAFF = TgBot(
-    name="staff",
-    token=os.environ.get("TG_BOT_TOKEN", ""),
-    secret=os.environ.get("TG_SECRET", ""),
-)
-GUEST = TgBot(
-    name="guest",
-    token=os.environ.get("TG_GUEST_BOT_TOKEN", ""),
-    secret=os.environ.get("TG_GUEST_SECRET", ""),
-)
+# Singleton instances — env vars are read lazily on each call.
+STAFF = TgBot(name="staff", token_env="TG_BOT_TOKEN", secret_env="TG_SECRET")
+GUEST = TgBot(name="guest", token_env="TG_GUEST_BOT_TOKEN", secret_env="TG_GUEST_SECRET")
 
 
 # ---- update parsing (bot-agnostic) ------------------------------------------
