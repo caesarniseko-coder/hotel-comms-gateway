@@ -8,7 +8,13 @@ import httpx
 
 TG_BOT_TOKEN = os.environ.get("TG_BOT_TOKEN", "")
 TG_SECRET = os.environ.get("TG_SECRET", "")
-TG_API = f"https://api.telegram.org/bot{TG_BOT_TOKEN}"
+# HF Spaces blocks egress to api.telegram.org — route through a CF Worker relay.
+TG_RELAY_URL = os.environ.get("TG_RELAY_URL", "").rstrip("/")
+TG_RELAY_SECRET = os.environ.get("TG_RELAY_SECRET", "")
+_API_BASE = TG_RELAY_URL or "https://api.telegram.org"
+TG_API = f"{_API_BASE}/bot{TG_BOT_TOKEN}"
+
+_RELAY_HEADERS: dict[str, str] = {"X-Relay-Secret": TG_RELAY_SECRET} if TG_RELAY_SECRET else {}
 
 _TIMEOUT = httpx.Timeout(connect=20.0, read=20.0, write=10.0, pool=15.0)
 
@@ -69,7 +75,7 @@ async def send(
     if message_thread_id:
         payload["message_thread_id"] = message_thread_id
 
-    async with httpx.AsyncClient(timeout=_TIMEOUT) as client:
+    async with httpx.AsyncClient(timeout=_TIMEOUT, headers=_RELAY_HEADERS) as client:
         r = await client.post(f"{TG_API}/sendMessage", json=payload)
         if r.status_code == 200:
             return r.json()
@@ -99,7 +105,7 @@ async def send(
 async def get_me() -> dict[str, Any]:
     if not TG_BOT_TOKEN:
         return {}
-    async with httpx.AsyncClient(timeout=_TIMEOUT) as client:
+    async with httpx.AsyncClient(timeout=_TIMEOUT, headers=_RELAY_HEADERS) as client:
         r = await client.get(f"{TG_API}/getMe")
         r.raise_for_status()
         return r.json().get("result", {})
