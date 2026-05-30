@@ -168,11 +168,36 @@ def _extract_json(text: str) -> dict | None:
         return None
 
 
-async def assess(text: str, guest_name: str | None = None, room_no: str | None = None) -> dict | None:
-    """If the message looks unusual, run the moderator and return its JSON plan."""
+async def assess(
+    text: str,
+    guest_name: str | None = None,
+    room_no: str | None = None,
+    *,
+    force: bool = False,
+    topic: str | None = None,
+    sentiment_tone: str | None = None,
+    follow_up_index: int = 0,
+) -> dict | None:
+    """Run the moderator if message warrants it. Returns None if not triggered."""
     unusual, signals = looks_unusual(text)
-    if not unusual:
+    # Broader auto-triggers
+    should_fire = (
+        force
+        or unusual
+        or (topic == "concierge" and len(text or "") >= 25)
+        or sentiment_tone in ("frustrated", "angry")
+        or follow_up_index >= 2
+    )
+    if not should_fire:
         return None
+    if not signals:
+        signals = []
+        if sentiment_tone in ("frustrated", "angry"):
+            signals.append(f"sentiment:{sentiment_tone}")
+        if follow_up_index >= 2:
+            signals.append(f"follow_up:{follow_up_index}")
+        if topic == "concierge":
+            signals.append("topic:concierge")
 
     user_msg = (
         f"Guest in Room {room_no or '?'} ({guest_name or 'unknown'}) wrote: "

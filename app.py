@@ -34,6 +34,7 @@ import search as web_search
 import sentiment
 import staff
 import store
+import watchdog
 import world
 
 log = logging.getLogger("app")
@@ -194,6 +195,42 @@ async def _dispatch_to_channel(channel: str, to: str, body: str) -> None:
                 )
             except Exception:
                 pass
+
+        # Auto-retry: if validator found warnings (refusal/topic-drift),
+        # post a corrective comment to the issue and re-wake the agent.
+        if report.get("warnings"):
+            try:
+                issue_id_retry = store.get_issue_id("telegram_guest", to)
+                if issue_id_retry:
+                    retry_key = f"retries:{issue_id_retry}"
+                    retries = int(store.kv_get(retry_key) or "0")
+                    if retries < 2:
+                        store.kv_set(retry_key, str(retries + 1))
+                        warns = ", ".join(report["warnings"])
+                        await pc.add_comment(
+                            issue_id=issue_id_retry,
+                            body=(
+                                f"SYSTEM CORRECTION (auto-retry {retries + 1}/2): your last "
+                                f"reply was rejected by the validator ({warns}). The guest is "
+                                f"in Room {expected_room}, name {expected_name}. "
+                                f"Re-read the MODERATOR ADVICE block + the guest's actual "
+                                f"request, then produce a SPECIFIC reply with a concrete "
+                                f"action and ETA. Do NOT refuse, do NOT ask for clarification, "
+                                f"do NOT use empty platitudes."
+                            ),
+                            author_kind="external",
+                        )
+                        if agent_label and agent_label != "Agent":
+                            try:
+                                await pc.wake_agent(agent_label, reason="auto_retry")
+                            except Exception:
+                                pass
+                        await _admin_mirror(
+                            f"🔁 Auto-retry {retries + 1}/2 — corrective comment posted to "
+                            f"`{issue_id_retry[:8]}`, agent re-woken."
+                        )
+            except Exception as exc:
+                log.warning("auto-retry failed: %s", exc)
     elif channel == "email":
         await email_brevo.send(to=to, text=_strip_for_guest(body))
     elif channel == "slack":
@@ -342,6 +379,12 @@ async def _startup() -> None:
             log.info("world driver auto-resumed (was running before restart)")
     except Exception as exc:
         log.warning("world driver auto-resume failed: %s", exc)
+    # Always start the watchdog
+    try:
+        asyncio.create_task(watchdog.run_loop())
+        log.info("watchdog loop launched")
+    except Exception as exc:
+        log.warning("watchdog launch failed: %s", exc)
 
 
 @app.on_event("shutdown")
@@ -1022,10 +1065,17 @@ async def _route_guest_room_message(
     title = f"[Room {room_no}] {sender_name}: {text[:60]}"
     profile_prose = _profile_prose()
 
-    # Moderator: if the request looks "unusual", call uncensored sidecar for guidance
+    # Moderator: fires on keyword OR concierge-topic OR escalated sentiment OR repeated follow-ups
     moderation_block = ""
     try:
-        plan = await moderator.assess(text, guest_name=sender_name, room_no=room_no)
+        plan = await moderator.assess(
+            text,
+            guest_name=sender_name,
+            room_no=room_no,
+            topic=intent,
+            sentiment_tone=(sentiment_info or {}).get("tone"),
+            follow_up_index=follow_up_index,
+        )
         if plan:
             moderation_block = "\n\n" + moderator.format_for_agent(plan) + "\n"
             await _admin_mirror(
