@@ -2,12 +2,17 @@
 from __future__ import annotations
 
 import os
+import socket
 from typing import Any, Optional
 import httpx
 
 TG_BOT_TOKEN = os.environ.get("TG_BOT_TOKEN", "")
 TG_SECRET = os.environ.get("TG_SECRET", "")
 TG_API = f"https://api.telegram.org/bot{TG_BOT_TOKEN}"
+
+# Force IPv4 — some HF Space network paths black-hole IPv6 to api.telegram.org
+_TRANSPORT = httpx.AsyncHTTPTransport(local_address="0.0.0.0", retries=2)
+_TIMEOUT = httpx.Timeout(connect=15.0, read=20.0, write=10.0, pool=15.0)
 
 
 def parse_update(update: dict[str, Any]) -> dict[str, Any] | None:
@@ -65,7 +70,7 @@ async def send(
     if message_thread_id:
         payload["message_thread_id"] = message_thread_id
 
-    async with httpx.AsyncClient(timeout=20.0) as client:
+    async with httpx.AsyncClient(transport=_TRANSPORT, timeout=_TIMEOUT) as client:
         r = await client.post(f"{TG_API}/sendMessage", json=payload)
         if r.status_code == 200:
             return r.json()
@@ -95,7 +100,7 @@ async def send(
 async def get_me() -> dict[str, Any]:
     if not TG_BOT_TOKEN:
         return {}
-    async with httpx.AsyncClient(timeout=10.0) as client:
+    async with httpx.AsyncClient(transport=_TRANSPORT, timeout=_TIMEOUT) as client:
         r = await client.get(f"{TG_API}/getMe")
         r.raise_for_status()
         return r.json().get("result", {})
