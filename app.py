@@ -204,19 +204,25 @@ async def web_token(session_id: str) -> dict[str, Any]:
 
 
 @app.post("/api/web/send")
-async def web_send(request: Request) -> dict[str, Any]:
-    payload = await request.json()
-    parsed = web.parse_inbound(payload)
-    if not parsed:
-        raise HTTPException(status_code=400, detail="bad payload")
-    result = await _route_guest_message(
-        channel="web",
-        sender_id=parsed["sender_id"],
-        sender_name=parsed["sender_name"],
-        text=parsed["text"],
-        to=parsed["to"],
-    )
-    return {"ok": True, **result}
+async def web_send(request: Request) -> JSONResponse:
+    try:
+        payload = await request.json()
+        parsed = web.parse_inbound(payload)
+        if not parsed:
+            return JSONResponse({"ok": False, "error": "bad payload"}, status_code=400)
+        result = await _route_guest_message(
+            channel="web",
+            sender_id=parsed["sender_id"],
+            sender_name=parsed["sender_name"],
+            text=parsed["text"],
+            to=parsed["to"],
+        )
+        return JSONResponse({"ok": True, **result})
+    except Exception as exc:
+        return JSONResponse(
+            {"ok": False, "error": type(exc).__name__, "detail": str(exc)[:1500]},
+            status_code=500,
+        )
 
 
 @app.get("/api/web/poll")
