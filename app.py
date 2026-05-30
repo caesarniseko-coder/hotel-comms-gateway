@@ -26,6 +26,7 @@ import guest_commands
 import guest_profile
 import paperclip_client as pc
 import poller
+import reply_validator
 import sentiment
 import staff
 import store
@@ -126,11 +127,22 @@ async def _dispatch_to_channel(channel: str, to: str, body: str) -> None:
         await STAFF_BOT.send(to=to, text=_strip_for_guest(body))
     elif channel == "telegram_guest":
         clean = _strip_for_guest(body)
-        await GUEST_BOT.send(to=to, text=clean)
-        # Mirror reply to admin (also clean — admin sees what the guest sees)
         room = store.get_room_for_guest(to) or {}
-        room_label = f"Room {room.get('room_number')}" if room.get("room_number") else f"tg:{to}"
-        guest_name = room.get("guest_name") or "guest"
+        expected_room = room.get("room_number") or ""
+        expected_name = room.get("guest_name") or ""
+
+        # VALIDATE — correct hallucinated room/name BEFORE guest sees it
+        corrected, report = reply_validator.correct_reply(
+            reply=clean,
+            expected_name=expected_name,
+            expected_room=expected_room,
+        )
+
+        await GUEST_BOT.send(to=to, text=corrected)
+
+        room_label = f"Room {expected_room}" if expected_room else f"tg:{to}"
+        guest_name = expected_name or "guest"
+
         # Look up the actual agent name from the most recent thread issue
         agent_label = "Agent"
         try:
@@ -146,7 +158,24 @@ async def _dispatch_to_channel(channel: str, to: str, body: str) -> None:
                             break
         except Exception:
             pass
-        await _admin_mirror(f"🛏 {room_label} ({guest_name}) ← {agent_label}:\n{clean[:1200]}")
+
+        mirror_text = f"🛏 {room_label} ({guest_name}) ← {agent_label}:\n{corrected[:1200]}"
+        if report.get("changes"):
+            mirror_text += f"\n_(🛠 auto-corrected: {', '.join(report['changes'])})_"
+        await _admin_mirror(mirror_text)
+
+        if report.get("altered"):
+            try:
+                store.log_event(
+                    event_type="reply_corrected",
+                    issue_id=store.get_issue_id("telegram_guest", to),
+                    actor="reply_validator",
+                    actor_kind="system",
+                    room_number=expected_room,
+                    payload={"changes": report["changes"]},
+                )
+            except Exception:
+                pass
     elif channel == "email":
         await email_brevo.send(to=to, text=_strip_for_guest(body))
     elif channel == "slack":
