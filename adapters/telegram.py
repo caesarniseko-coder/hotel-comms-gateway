@@ -1,26 +1,128 @@
-"""Telegram channel adapter — inbound parser + outbound send."""
+"""Multi-bot Telegram adapter.
+
+Supports two bots:
+  • STAFF  — @kutchan_hotel_concierge_bot — staff workspace + admin commands
+  • GUEST  — @kutchan_hotel_guests_bot   — per-room guest channel
+
+Outbound goes through the Cloudflare Worker relay (TG_RELAY_URL) because HF
+Spaces blocks api.telegram.org egress.
+"""
 from __future__ import annotations
 
+import logging
 import os
-import socket
 from typing import Any, Optional
 import httpx
 
-TG_BOT_TOKEN = os.environ.get("TG_BOT_TOKEN", "")
-TG_SECRET = os.environ.get("TG_SECRET", "")
-# HF Spaces blocks egress to api.telegram.org — route through a CF Worker relay.
+log = logging.getLogger("telegram")
+
+# Shared relay (works for any bot — the token is in the URL path)
 TG_RELAY_URL = os.environ.get("TG_RELAY_URL", "").rstrip("/")
 TG_RELAY_SECRET = os.environ.get("TG_RELAY_SECRET", "")
-_API_BASE = TG_RELAY_URL or "https://api.telegram.org"
-TG_API = f"{_API_BASE}/bot{TG_BOT_TOKEN}"
-
+_API_ROOT = TG_RELAY_URL or "https://api.telegram.org"
 _RELAY_HEADERS: dict[str, str] = {"X-Relay-Secret": TG_RELAY_SECRET} if TG_RELAY_SECRET else {}
-
 _TIMEOUT = httpx.Timeout(connect=20.0, read=20.0, write=10.0, pool=15.0)
 
 
+class TgBot:
+    def __init__(self, *, name: str, token: str, secret: str = "") -> None:
+        self.name = name
+        self.token = token
+        self.secret = secret  # the secret_token we required Telegram to send back
+
+    @property
+    def configured(self) -> bool:
+        return bool(self.token)
+
+    @property
+    def api(self) -> str:
+        return f"{_API_ROOT}/bot{self.token}"
+
+    async def send(
+        self,
+        *,
+        to: str,
+        text: str,
+        reply_to_message_id: Optional[int] = None,
+        message_thread_id: Optional[int] = None,
+        parse_mode: str = "",
+    ) -> dict[str, Any]:
+        if not self.configured:
+            return {"skipped": True, "bot": self.name, "reason": "not configured"}
+        payload: dict[str, Any] = {
+            "chat_id": to,
+            "text": text[:4096],
+            "disable_web_page_preview": True,
+        }
+        if parse_mode:
+            payload["parse_mode"] = parse_mode
+        if message_thread_id:
+            payload["message_thread_id"] = message_thread_id
+
+        async with httpx.AsyncClient(timeout=_TIMEOUT, headers=_RELAY_HEADERS) as client:
+            r = await client.post(f"{self.api}/sendMessage", json=payload)
+            if r.status_code == 200:
+                return r.json()
+            body = r.text or ""
+            if r.status_code == 400 and "parse_mode" in payload:
+                payload.pop("parse_mode", None)
+                r2 = await client.post(f"{self.api}/sendMessage", json=payload)
+                if r2.status_code == 200:
+                    return r2.json()
+                raise RuntimeError(
+                    f"[{self.name}] sendMessage failed (after plaintext retry): "
+                    f"{r2.status_code} {r2.text[:400]}"
+                )
+            raise RuntimeError(
+                f"[{self.name}] sendMessage failed: {r.status_code} {body[:400]}"
+            )
+
+    async def get_me(self) -> dict[str, Any]:
+        if not self.configured:
+            return {}
+        async with httpx.AsyncClient(timeout=_TIMEOUT, headers=_RELAY_HEADERS) as client:
+            r = await client.get(f"{self.api}/getMe")
+            r.raise_for_status()
+            return r.json().get("result", {})
+
+    async def set_webhook(
+        self,
+        *,
+        url: str,
+        secret_token: str,
+        allowed_updates: list[str] | None = None,
+    ) -> dict[str, Any]:
+        async with httpx.AsyncClient(timeout=_TIMEOUT, headers=_RELAY_HEADERS) as client:
+            r = await client.post(
+                f"{self.api}/setWebhook",
+                json={
+                    "url": url,
+                    "secret_token": secret_token,
+                    "allowed_updates": allowed_updates or ["message"],
+                    "drop_pending_updates": False,
+                },
+            )
+            r.raise_for_status()
+            return r.json()
+
+
+# Singleton instances
+STAFF = TgBot(
+    name="staff",
+    token=os.environ.get("TG_BOT_TOKEN", ""),
+    secret=os.environ.get("TG_SECRET", ""),
+)
+GUEST = TgBot(
+    name="guest",
+    token=os.environ.get("TG_GUEST_BOT_TOKEN", ""),
+    secret=os.environ.get("TG_GUEST_SECRET", ""),
+)
+
+
+# ---- update parsing (bot-agnostic) ------------------------------------------
+
 def parse_update(update: dict[str, Any]) -> dict[str, Any] | None:
-    """Parse an incoming Telegram update. Returns rich info, or None to skip."""
+    """Parse an inbound Telegram update into a normalised dict, or None to skip."""
     msg = update.get("message") or update.get("edited_message")
     if not msg:
         return None
@@ -53,59 +155,11 @@ def parse_update(update: dict[str, Any]) -> dict[str, Any] | None:
     }
 
 
-async def send(
-    *,
-    to: str,
-    text: str,
-    reply_to_message_id: Optional[int] = None,
-    message_thread_id: Optional[int] = None,
-    parse_mode: str = "",
-) -> dict[str, Any]:
-    if not TG_BOT_TOKEN:
-        return {"skipped": True}
-    payload: dict[str, Any] = {
-        "chat_id": to,
-        "text": text[:4096],
-        "disable_web_page_preview": True,
-    }
-    if parse_mode:
-        payload["parse_mode"] = parse_mode
-    if reply_to_message_id:
-        payload["reply_to_message_id"] = reply_to_message_id
-    if message_thread_id:
-        payload["message_thread_id"] = message_thread_id
+# ---- back-compat module-level helpers (default to STAFF bot) ----------------
 
-    async with httpx.AsyncClient(timeout=_TIMEOUT, headers=_RELAY_HEADERS) as client:
-        r = await client.post(f"{TG_API}/sendMessage", json=payload)
-        if r.status_code == 200:
-            return r.json()
-
-        # Surface Telegram's error body
-        body = ""
-        try:
-            body = r.text
-        except Exception:
-            pass
-
-        # Any 400 with parse_mode set → retry plain
-        if r.status_code == 400 and "parse_mode" in payload:
-            payload.pop("parse_mode", None)
-            r2 = await client.post(f"{TG_API}/sendMessage", json=payload)
-            if r2.status_code == 200:
-                return r2.json()
-            raise RuntimeError(
-                f"telegram sendMessage failed (after plaintext retry): {r2.status_code} {r2.text[:400]}"
-            )
-
-        raise RuntimeError(
-            f"telegram sendMessage failed: {r.status_code} {body[:400]}"
-        )
+async def send(**kw: Any) -> dict[str, Any]:
+    return await STAFF.send(**kw)
 
 
 async def get_me() -> dict[str, Any]:
-    if not TG_BOT_TOKEN:
-        return {}
-    async with httpx.AsyncClient(timeout=_TIMEOUT, headers=_RELAY_HEADERS) as client:
-        r = await client.get(f"{TG_API}/getMe")
-        r.raise_for_status()
-        return r.json().get("result", {})
+    return await STAFF.get_me()

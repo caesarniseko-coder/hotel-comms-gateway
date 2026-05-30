@@ -92,7 +92,11 @@ async def handle_help() -> str:
         "• `/seed_day` — re-seed daily standing tasks\n\n"
         "*Group setup* (admin)\n"
         "• `/dept <slug>` — bind this Telegram group to a department\n"
-        "• `/register @user <role>` — assign a role to a colleague"
+        "• `/register @user <role>` — assign a role to a colleague\n\n"
+        "*Guest channel* (admin)\n"
+        "• `/rooms` — list currently checked-in guests\n"
+        "• `/room <num>` — show activity for a specific room\n"
+        "• `/checkin_admin @user <room>` — force check-in"
     )
 
 
@@ -516,6 +520,76 @@ async def handle_seed_day(tg_user_id: str, args: str) -> str:
     )
 
 
+async def handle_rooms(tg_user_id: str) -> str:
+    if not staff.is_admin(tg_user_id):
+        return "🔒 Admin only."
+    rooms = store.list_active_rooms()
+    if not rooms:
+        return "🛏 No guests currently checked in."
+    lines = [f"*Checked-in guests* ({len(rooms)})\n"]
+    import datetime
+    for r in rooms[:25]:
+        when = datetime.datetime.fromtimestamp(r["check_in_at"]).strftime("%Y-%m-%d %H:%M")
+        lines.append(
+            f"  • Room *{r['room_number']}* — {r.get('guest_name') or 'guest'} "
+            f"(in: {when})"
+        )
+    if len(rooms) > 25:
+        lines.append(f"  …and {len(rooms) - 25} more.")
+    return "\n".join(lines)
+
+
+async def handle_room(tg_user_id: str, args: str) -> str:
+    """Show the conversation thread for a specific room."""
+    if not staff.is_admin(tg_user_id):
+        return "🔒 Admin only."
+    if not args:
+        return "Usage: `/room <number>` — e.g. `/room 408`"
+    room_number = args.strip()
+    guests = store.get_guests_in_room(room_number)
+    if not guests:
+        return f"🛏 Room {room_number} is currently vacant (no active check-in)."
+    lines = [f"*Room {room_number}* — recent activity"]
+    for g in guests:
+        lines.append(f"  Guest: {g.get('guest_name') or 'unknown'}")
+        # Find the most recent issue for this guest
+        issue_id = store.get_issue_id("telegram_guest", g["tg_user_id"])
+        if issue_id:
+            try:
+                issue = await pc.get_issue(issue_id)
+                status = issue.get("status", "?")
+                lines.append(f"  Active thread: `{issue_id[:8]}` ({status})")
+            except Exception:
+                pass
+        else:
+            lines.append("  No active threads yet.")
+    return "\n".join(lines)
+
+
+async def handle_checkin_admin(tg_user_id: str, args: str) -> str:
+    if not staff.is_admin(tg_user_id):
+        return "🔒 Admin only."
+    parts = args.split(maxsplit=2)
+    if len(parts) < 2:
+        return "Usage: `/checkin_admin @username <room> [name]`"
+    uname = parts[0].lstrip("@")
+    room = parts[1]
+    name = parts[2] if len(parts) > 2 else None
+    target = store.get_staff_by_username(uname)
+    if not target:
+        return (
+            f"❓ {parts[0]} hasn't started the *guest bot* yet. "
+            f"Ask them to /start there first."
+        )
+    rec = store.check_in_guest(
+        tg_user_id=target["tg_user_id"],
+        room_number=room,
+        guest_name=name or target.get("display_name"),
+        tg_chat_id=target["tg_user_id"],
+    )
+    return f"✅ Checked in {parts[0]} → Room *{rec['room_number']}*."
+
+
 async def handle_register(tg_user_id: str, args: str) -> str:
     if not staff.is_admin(tg_user_id):
         return "🔒 Admin only."
@@ -586,4 +660,10 @@ async def dispatch(*, text: str, msg_from: dict, chat: dict) -> Optional[str]:
         return await handle_stop_day(tg_user_id, args)
     if cmd in ("world", "state", "snapshot"):
         return await handle_world(tg_user_id)
+    if cmd == "rooms":
+        return await handle_rooms(tg_user_id)
+    if cmd == "room":
+        return await handle_room(tg_user_id, args)
+    if cmd in ("checkin_admin", "guest_checkin"):
+        return await handle_checkin_admin(tg_user_id, args)
     return None  # unknown command — caller decides whether to ignore

@@ -18,9 +18,11 @@ from fastapi import FastAPI, Header, HTTPException, Request
 from fastapi.responses import JSONResponse, PlainTextResponse
 
 from adapters import telegram, email_brevo, slack, web
+from adapters.telegram import STAFF as STAFF_BOT, GUEST as GUEST_BOT
 import agent_listener
 import classifier
 import commands
+import guest_commands
 import paperclip_client as pc
 import poller
 import staff
@@ -51,6 +53,7 @@ def _strip_meta(text: str) -> str:
 GUEST_PROJECT_ID = os.environ["PAPERCLIP_GUEST_PROJECT_ID"]
 STAFF_PROJECT_ID = os.environ.get("PAPERCLIP_STAFF_PROJECT_ID", GUEST_PROJECT_ID)
 TG_SECRET = os.environ.get("TG_SECRET", "")
+TG_GUEST_SECRET = os.environ.get("TG_GUEST_SECRET", "")
 BREVO_INBOUND_SECRET = os.environ.get("BREVO_INBOUND_SECRET", "")
 
 app = FastAPI(title="Hotel Comms Gateway")
@@ -76,11 +79,30 @@ _web_inbox: dict[str, deque[str]] = defaultdict(deque)
 _web_lock = asyncio.Lock()
 
 
+async def _admin_mirror(text: str) -> None:
+    """Fan out a short notification to the workspace admin's DM (staff bot)."""
+    admin_id = staff.admin_user_id()
+    if not admin_id:
+        return
+    try:
+        await STAFF_BOT.send(to=str(admin_id), text=text)
+    except Exception as exc:
+        log.warning("admin mirror failed: %s", exc)
+
+
 async def _dispatch_to_channel(channel: str, to: str, body: str) -> None:
     """Outbound dispatcher used by the poller for *guest* channels."""
     channel = (channel or "").lower()
     if channel == "telegram":
-        await telegram.send(to=to, text=body)
+        await STAFF_BOT.send(to=to, text=body)
+    elif channel == "telegram_guest":
+        # Reply to the guest via the GUEST bot
+        await GUEST_BOT.send(to=to, text=body)
+        # Mirror reply to admin
+        room = store.get_room_for_guest(to) or {}
+        room_label = f"Room {room.get('room_number')}" if room.get("room_number") else f"tg:{to}"
+        guest_name = room.get("guest_name") or "guest"
+        await _admin_mirror(f"🛏 {room_label} ({guest_name}) ← Concierge:\n{body[:1200]}")
     elif channel == "email":
         await email_brevo.send(to=to, text=body)
     elif channel == "slack":
@@ -499,6 +521,133 @@ async def _handle_telegram_update(update: dict) -> JSONResponse:
         to=parsed["to"],
     )
     return JSONResponse({"ok": True, "handled": "guest", **result})
+
+
+# ---------------------------------------------------------------------------
+# Guest bot — Telegram webhook (per-room private channels)
+# ---------------------------------------------------------------------------
+
+@app.post("/webhook/telegram_guest")
+async def telegram_guest_webhook(
+    request: Request,
+    x_telegram_bot_api_secret_token: str | None = Header(default=None),
+) -> JSONResponse:
+    if TG_GUEST_SECRET and x_telegram_bot_api_secret_token != TG_GUEST_SECRET:
+        raise HTTPException(status_code=401, detail="bad guest secret")
+    try:
+        update = await request.json()
+        _last_updates.append({"ts": int(time.time()), "update": update, "bot": "guest"})
+        return await _handle_guest_update(update)
+    except Exception as exc:
+        import traceback
+        log.exception("guest webhook failed: %s", exc)
+        _record_error("guest_webhook", exc)
+        return JSONResponse({
+            "ok": False, "error": type(exc).__name__,
+            "detail": str(exc)[:600],
+            "tb": traceback.format_exc().splitlines()[-6:],
+        })
+
+
+async def _handle_guest_update(update: dict) -> JSONResponse:
+    parsed = telegram.parse_update(update)
+    if not parsed:
+        return JSONResponse({"ok": True, "skipped": True})
+    if parsed.get("update_id") and store.seen(f"tgg:{parsed['update_id']}"):
+        return JSONResponse({"ok": True, "duplicate": True})
+
+    msg_from = parsed["from"]
+    chat = parsed["chat"]
+    tg_user_id = str(msg_from.get("id"))
+    text = parsed["text"]
+
+    # --- Commands (checkin/checkout/help/start/room) -----------------------
+    if parsed["is_command"]:
+        try:
+            reply = await guest_commands.dispatch(text=text, msg_from=msg_from, chat=chat)
+        except Exception as exc:
+            log.exception("guest command failed: %s", exc)
+            reply = f"Something went wrong: {exc}"
+        if reply:
+            await GUEST_BOT.send(to=parsed["to"], text=reply)
+        return JSONResponse({"ok": True, "handled": "guest_command"})
+
+    # --- Free-form message: must be checked into a room --------------------
+    room = store.get_room_for_guest(tg_user_id)
+    if not room:
+        await GUEST_BOT.send(
+            to=parsed["to"],
+            text=(
+                "Welcome to Grand Hotel! To get started, please claim your room:\n"
+                "  /checkin <room number>\ne.g. /checkin 408"
+            ),
+        )
+        return JSONResponse({"ok": True, "handled": "checkin_prompt"})
+
+    # Mirror inbound to admin so they see what the guest is asking
+    await _admin_mirror(
+        f"🛏 Room {room['room_number']} ({room.get('guest_name') or 'guest'}) →\n{text[:1200]}"
+    )
+
+    # Route to Paperclip (Guest Conversations project), classify + assign
+    result = await _route_guest_room_message(
+        room=room,
+        msg_from=msg_from,
+        text=text,
+    )
+    return JSONResponse({"ok": True, "handled": "guest_message", **result})
+
+
+async def _route_guest_room_message(
+    *,
+    room: dict,
+    msg_from: dict,
+    text: str,
+) -> dict[str, Any]:
+    """Create/append a Paperclip issue for a guest message, assigned by intent."""
+    tg_user_id = str(msg_from.get("id"))
+    sender_name = room.get("guest_name") or (
+        (msg_from.get("first_name") or "") + " " + (msg_from.get("last_name") or "")
+    ).strip() or f"Room {room['room_number']}"
+
+    # Thread continuity: same guest → same issue
+    issue_id = store.get_issue_id("telegram_guest", tg_user_id)
+    if issue_id:
+        await pc.add_comment(
+            issue_id=issue_id,
+            body=f"**{sender_name}** (Room {room['room_number']}):\n\n{text}",
+            author_kind="external",
+            extra_metadata={"room": room["room_number"], "sender": sender_name},
+        )
+        return {"issue_id": issue_id, "created": False}
+
+    intent, assignee, priority = await classifier.classify(text)
+    title = f"[Room {room['room_number']}] {sender_name}: {text[:60]}"
+    body = (
+        f"**Room:** {room['room_number']}\n"
+        f"**Guest:** {sender_name}\n"
+        f"**Channel:** telegram_guest\n"
+        f"**Intent:** {intent}\n\n"
+        f"---\n\n{text}"
+    )
+    issue = await pc.create_issue(
+        project_id=GUEST_PROJECT_ID,
+        title=title,
+        body=body,
+        assignee_slug=assignee,
+        channel="telegram_guest",
+        to=tg_user_id,
+        priority=priority,
+        extra_metadata={
+            "room": room["room_number"],
+            "guest_name": sender_name,
+            "intent": intent,
+        },
+    )
+    issue_id = str(issue.get("id") or "")
+    if issue_id:
+        store.set_issue_id("telegram_guest", tg_user_id, issue_id)
+    return {"issue_id": issue_id, "created": True, "intent": intent, "assignee": assignee}
 
 
 # --- Brevo email -----------------------------------------------------------

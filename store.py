@@ -64,6 +64,17 @@ CREATE TABLE IF NOT EXISTS issue_origin (
     department     TEXT,
     created_at     INTEGER NOT NULL
 );
+
+-- Hotel-side: which Telegram guest user is currently in which room
+CREATE TABLE IF NOT EXISTS room_assignments (
+    tg_user_id     TEXT PRIMARY KEY,
+    room_number    TEXT NOT NULL,
+    guest_name     TEXT,
+    check_in_at    INTEGER NOT NULL,
+    check_out_at   INTEGER,
+    tg_chat_id     TEXT
+);
+CREATE INDEX IF NOT EXISTS idx_room_active ON room_assignments(room_number) WHERE check_out_at IS NULL;
 """
 
 
@@ -263,6 +274,61 @@ def list_issue_origins(since_days: int = 30) -> list[dict]:
     cutoff = int(time.time()) - since_days * 86400
     with _conn() as c:
         rows = c.execute("SELECT * FROM issue_origin WHERE created_at >= ?", (cutoff,)).fetchall()
+        return [dict(r) for r in rows]
+
+
+# ---- room assignments -------------------------------------------------------
+
+def check_in_guest(
+    tg_user_id: str,
+    room_number: str,
+    guest_name: Optional[str] = None,
+    tg_chat_id: Optional[str] = None,
+) -> dict:
+    """Check a guest in. Idempotent — overwrites prior assignment."""
+    now = int(time.time())
+    with _conn() as c:
+        c.execute(
+            "INSERT OR REPLACE INTO room_assignments(tg_user_id, room_number, guest_name, check_in_at, check_out_at, tg_chat_id) "
+            "VALUES (?, ?, ?, ?, NULL, ?)",
+            (tg_user_id, room_number, guest_name, now, tg_chat_id),
+        )
+        row = c.execute("SELECT * FROM room_assignments WHERE tg_user_id=?", (tg_user_id,)).fetchone()
+        return dict(row)
+
+
+def check_out_guest(tg_user_id: str) -> Optional[dict]:
+    now = int(time.time())
+    with _conn() as c:
+        c.execute("UPDATE room_assignments SET check_out_at=? WHERE tg_user_id=? AND check_out_at IS NULL",
+                  (now, tg_user_id))
+        row = c.execute("SELECT * FROM room_assignments WHERE tg_user_id=?", (tg_user_id,)).fetchone()
+        return dict(row) if row else None
+
+
+def get_room_for_guest(tg_user_id: str) -> Optional[dict]:
+    with _conn() as c:
+        row = c.execute(
+            "SELECT * FROM room_assignments WHERE tg_user_id=? AND check_out_at IS NULL",
+            (tg_user_id,),
+        ).fetchone()
+        return dict(row) if row else None
+
+
+def get_guests_in_room(room_number: str) -> list[dict]:
+    with _conn() as c:
+        rows = c.execute(
+            "SELECT * FROM room_assignments WHERE room_number=? AND check_out_at IS NULL ORDER BY check_in_at DESC",
+            (room_number,),
+        ).fetchall()
+        return [dict(r) for r in rows]
+
+
+def list_active_rooms() -> list[dict]:
+    with _conn() as c:
+        rows = c.execute(
+            "SELECT * FROM room_assignments WHERE check_out_at IS NULL ORDER BY check_in_at DESC"
+        ).fetchall()
         return [dict(r) for r in rows]
 
 
