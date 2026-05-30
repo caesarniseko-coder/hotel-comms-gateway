@@ -593,6 +593,26 @@ async def handle_events(tg_user_id: str, args: str) -> str:
     return "\n".join(lines)
 
 
+async def handle_moderate(tg_user_id: str, args: str) -> str:
+    if not staff.is_admin(tg_user_id):
+        return "🔒 Admin only."
+    if not args.strip():
+        return "Usage: `/moderate <unusual request>` — e.g. `/moderate I want to dance with dolphins`"
+    import moderator as mod
+    plan = await mod.assess(args.strip(), guest_name="Demo", room_no="—")
+    if not plan:
+        return "Not flagged as unusual (no trigger keywords)."
+    import json as _json
+    return (
+        f"*Moderator output* (model: {plan.get('model_used')})\n"
+        f"Category: *{plan.get('category')}*  | doable: *{plan.get('is_directly_doable')}*\n"
+        f"Interpretation: {plan.get('interpretation')}\n"
+        f"Plan: {plan.get('concierge_plan')}\n"
+        f"Suggest: {plan.get('suggested_vendor_or_alternative')}\n"
+        f"Tone: {plan.get('tone')}  · ethical: {plan.get('ethical_flag')}"
+    )
+
+
 async def handle_search_web(tg_user_id: str, args: str) -> str:
     if not staff.is_admin(tg_user_id):
         return "🔒 Admin only."
@@ -899,4 +919,6 @@ async def dispatch(*, text: str, msg_from: dict, chat: dict) -> Optional[str]:
         return await handle_threads(tg_user_id, args)
     if cmd in ("search_web", "searchweb", "web", "google"):
         return await handle_search_web(tg_user_id, args)
+    if cmd in ("moderate", "review"):
+        return await handle_moderate(tg_user_id, args)
     return None  # unknown command — caller decides whether to ignore

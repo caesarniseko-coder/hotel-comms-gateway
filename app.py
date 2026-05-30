@@ -26,6 +26,7 @@ import guest_commands
 import guest_profile
 import intent_split
 import memory as guest_mem
+import moderator
 import paperclip_client as pc
 import poller
 import reply_validator
@@ -1021,6 +1022,20 @@ async def _route_guest_room_message(
     title = f"[Room {room_no}] {sender_name}: {text[:60]}"
     profile_prose = _profile_prose()
 
+    # Moderator: if the request looks "unusual", call uncensored sidecar for guidance
+    moderation_block = ""
+    try:
+        plan = await moderator.assess(text, guest_name=sender_name, room_no=room_no)
+        if plan:
+            moderation_block = "\n\n" + moderator.format_for_agent(plan) + "\n"
+            await _admin_mirror(
+                f"🧭 *Moderator engaged* ({plan.get('model_used','?')}) — "
+                f"signals: {', '.join(plan.get('signals',[])[:3])}; "
+                f"plan: {plan.get('concierge_plan','?')[:140]}"
+            )
+    except Exception as exc:
+        log.warning("moderator failed: %s", exc)
+
     # If the topic needs external info, fetch search snippets and embed them
     search_block = ""
     if intent in ("concierge",) and any(
@@ -1053,6 +1068,7 @@ async def _route_guest_room_message(
         + (f" {tone_note}" if tone_note else "")
         + "\n\n"
         + (f"{profile_prose}\n\n" if profile_prose else "")
+        + moderation_block
         + search_block
         + "Reply directly to the guest now. "
         f"Use their EXACT name ({sender_name}) and EXACT room number ({room_no}) — "
