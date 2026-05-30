@@ -24,6 +24,7 @@ import classifier
 import commands
 import guest_commands
 import guest_profile
+import memory as guest_mem
 import paperclip_client as pc
 import poller
 import reply_validator
@@ -884,6 +885,27 @@ async def _route_guest_room_message(
 
     # Detect topic intent for the STATE lock
     quick_intent, _, _ = await classifier.classify(text)
+
+    # Update + pull structured memory
+    store.remember_guest(
+        tg_user_id=tg_user_id,
+        sentiment_score=(sentiment_info or {}).get("score"),
+        last_room=room_no,
+    )
+    store.remember_room(
+        room_number=room_no,
+        occupied=True,
+        current_guest_tg=tg_user_id,
+        complaint=(sentiment_info or {}).get("tone") in ("frustrated", "angry"),
+    )
+    memory_block = guest_mem.derive_memory_block(
+        tg_user_id=tg_user_id,
+        room_number=room_no,
+        guest_name=sender_name,
+        sentiment_info=sentiment_info,
+        follow_up_index=follow_up_index,
+    )
+
     state_lock = (
         f"\n\n<STATE>\n"
         f"  room: {room_no}\n"
@@ -891,7 +913,8 @@ async def _route_guest_room_message(
         f"  topic: {quick_intent}\n"
         f"  channel: telegram_guest\n"
         f"</STATE>\n"
-        f"FACT-CHECK: Your reply MUST use room={room_no} and name={sender_name}. "
+        + (f"\n{memory_block}\n" if memory_block else "")
+        + f"FACT-CHECK: Your reply MUST use room={room_no} and name={sender_name}. "
         f"The guest's topic is {quick_intent}. Do not change these."
     )
 

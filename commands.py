@@ -593,6 +593,99 @@ async def handle_events(tg_user_id: str, args: str) -> str:
     return "\n".join(lines)
 
 
+async def handle_search(tg_user_id: str, args: str) -> str:
+    if not staff.is_admin(tg_user_id):
+        return "🔒 Admin only."
+    if not args.strip():
+        return "Usage: `/search <query>` — full-text search over the event log."
+    results = store.search_events(args.strip(), limit=15)
+    if not results:
+        return f"No matches for `{args.strip()}`."
+    import datetime, json as _json
+    lines = [f"*Search* `{args.strip()}` — {len(results)} matches\n"]
+    for r in results[:15]:
+        ts = datetime.datetime.fromtimestamp(r["ts"]).strftime("%m-%d %H:%M")
+        actor = r.get("actor") or "?"
+        et = r.get("event_type") or "?"
+        room = f" R{r['room_number']}" if r.get("room_number") else ""
+        snippet = ""
+        if r.get("payload"):
+            try:
+                p = _json.loads(r["payload"])
+                snippet = (p.get("text") or p.get("body") or "")[:60]
+            except Exception:
+                pass
+        lines.append(f"  {ts}{room} *{et}* {actor}: {snippet}")
+    return "\n".join(lines)
+
+
+async def handle_guest_memory(tg_user_id: str, args: str) -> str:
+    if not staff.is_admin(tg_user_id):
+        return "🔒 Admin only."
+    if not args:
+        return "Usage: `/guest @username` or `/guest <tg_user_id>`"
+    needle = args.strip().lstrip("@").lower()
+    # Try staff_members by username
+    target_id = None
+    by_uname = store.get_staff_by_username(needle)
+    if by_uname:
+        target_id = by_uname["tg_user_id"]
+    else:
+        # Maybe it's already a raw id
+        if needle.isdigit():
+            target_id = needle
+    if not target_id:
+        # Try matching on display_name in room_assignments
+        for r in store.list_active_rooms():
+            if (r.get("guest_name") or "").lower() == needle:
+                target_id = r["tg_user_id"]
+                break
+    if not target_id:
+        return f"❓ No record for `{args}`."
+
+    g = store.get_guest_memory(target_id)
+    room = store.get_room_for_guest(target_id)
+    if not g and not room:
+        return f"No memory or active stay for {args}."
+    lines = [f"*Guest memory — {args}*\n"]
+    if g:
+        import datetime
+        lines.append(f"First contact: {datetime.datetime.fromtimestamp(g['first_contact']):%Y-%m-%d %H:%M}")
+        lines.append(f"Messages: {g['message_count']}  ·  Stays: {g['stays_count']}")
+        if g.get("sentiment_avg") is not None:
+            lines.append(f"Avg sentiment: {g['sentiment_avg']:.1f}")
+        if g.get("last_room"):
+            lines.append(f"Last room: {g['last_room']}")
+        if g.get("vip_flag"):
+            lines.append("VIP flag set")
+        if g.get("preferences"):
+            lines.append(f"Stated preferences: {g['preferences']}")
+    if room:
+        lines.append(f"\nCurrently checked into: *Room {room['room_number']}*")
+    return "\n".join(lines)
+
+
+async def handle_room_history(tg_user_id: str, args: str) -> str:
+    if not staff.is_admin(tg_user_id):
+        return "🔒 Admin only."
+    if not args:
+        return "Usage: `/room_history <room_number>`"
+    room_no = args.strip().split()[0]
+    r = store.get_room_memory(room_no)
+    if not r:
+        return f"No memory for Room {room_no} yet."
+    import datetime
+    lines = [f"*Room {room_no} — history*\n"]
+    lines.append(f"Currently occupied: {'yes' if r.get('occupied') else 'no'}")
+    if r.get('last_checkout'):
+        lines.append(f"Last checkout: {datetime.datetime.fromtimestamp(r['last_checkout']):%Y-%m-%d %H:%M}")
+    if r.get('last_service'):
+        lines.append(f"Last service: {datetime.datetime.fromtimestamp(r['last_service']):%Y-%m-%d %H:%M}")
+    lines.append(f"Open work orders: {r.get('open_wos', 0)}")
+    lines.append(f"Complaints (lifetime): {r.get('complaints_count', 0)}")
+    return "\n".join(lines)
+
+
 async def handle_rooms(tg_user_id: str) -> str:
     if not staff.is_admin(tg_user_id):
         return "🔒 Admin only."
@@ -743,4 +836,10 @@ async def dispatch(*, text: str, msg_from: dict, chat: dict) -> Optional[str]:
         return await handle_analytics(tg_user_id, args)
     if cmd in ("events", "timeline"):
         return await handle_events(tg_user_id, args)
+    if cmd == "guest":
+        return await handle_guest_memory(tg_user_id, args)
+    if cmd in ("room_history", "roomhist"):
+        return await handle_room_history(tg_user_id, args)
+    if cmd in ("search", "find"):
+        return await handle_search(tg_user_id, args)
     return None  # unknown command — caller decides whether to ignore

@@ -93,6 +93,12 @@ async def handle_checkin(tg_user_id: str, msg_from: dict, args: str) -> str:
         tg_chat_id=tg_user_id,
         profile_json=json.dumps(profile),
     )
+    # Bump stays counter for cross-stay memory
+    try:
+        store.remember_guest(tg_user_id=tg_user_id, last_room=room)
+        store.bump_guest_stays(tg_user_id)
+    except Exception:
+        pass
     nights = profile["nights"]
     night_word = "night" if nights == 1 else "nights"
     loyalty = profile.get("loyalty_tier")

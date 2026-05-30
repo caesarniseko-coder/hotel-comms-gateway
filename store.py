@@ -85,6 +85,49 @@ CREATE INDEX IF NOT EXISTS idx_events_ts ON workflow_events(ts);
 CREATE INDEX IF NOT EXISTS idx_events_type ON workflow_events(event_type);
 CREATE INDEX IF NOT EXISTS idx_events_room ON workflow_events(room_number);
 
+-- FTS5 virtual table over workflow event payloads for /search
+CREATE VIRTUAL TABLE IF NOT EXISTS workflow_events_fts USING fts5(
+    issue_id UNINDEXED,
+    actor UNINDEXED,
+    event_type UNINDEXED,
+    room_number UNINDEXED,
+    body,
+    content='workflow_events',
+    content_rowid='id'
+);
+CREATE TRIGGER IF NOT EXISTS workflow_events_ai AFTER INSERT ON workflow_events BEGIN
+    INSERT INTO workflow_events_fts(rowid, issue_id, actor, event_type, room_number, body)
+    VALUES (new.id, new.issue_id, new.actor, new.event_type, new.room_number,
+            COALESCE(new.payload, ''));
+END;
+
+-- Cross-stay guest memory (keyed by tg_user_id)
+CREATE TABLE IF NOT EXISTS guest_memory (
+    tg_user_id     TEXT PRIMARY KEY,
+    first_contact  INTEGER NOT NULL,
+    last_contact   INTEGER NOT NULL,
+    message_count  INTEGER NOT NULL DEFAULT 0,
+    stays_count    INTEGER NOT NULL DEFAULT 0,
+    sentiment_avg  REAL,
+    vip_flag       INTEGER NOT NULL DEFAULT 0,
+    last_room      TEXT,
+    preferences    TEXT,             -- JSON array of stated prefs
+    notes          TEXT,             -- free-form notes added by agents/admin
+    total_spend_usd REAL NOT NULL DEFAULT 0
+);
+
+-- Per-room memory (history of occupants, defects, services)
+CREATE TABLE IF NOT EXISTS room_memory (
+    room_number    TEXT PRIMARY KEY,
+    occupied       INTEGER NOT NULL DEFAULT 0,
+    current_guest_tg TEXT,
+    last_checkout  INTEGER,
+    last_service   INTEGER,
+    open_wos       INTEGER NOT NULL DEFAULT 0,
+    complaints_count INTEGER NOT NULL DEFAULT 0,
+    notes          TEXT
+);
+
 -- Hotel-side: which Telegram guest user is currently in which room
 CREATE TABLE IF NOT EXISTS room_assignments (
     tg_user_id     TEXT PRIMARY KEY,
@@ -359,6 +402,123 @@ def list_active_rooms() -> list[dict]:
         return [dict(r) for r in rows]
 
 
+# ---- guest_memory + room_memory --------------------------------------------
+
+def remember_guest(
+    tg_user_id: str,
+    *,
+    sentiment_score: Optional[float] = None,
+    last_room: Optional[str] = None,
+    preferences: Optional[list[str]] = None,
+    notes: Optional[str] = None,
+    vip: Optional[bool] = None,
+) -> dict:
+    """Increment guest-memory counters and update metadata."""
+    import json as _json
+    now = int(time.time())
+    with _conn() as c:
+        existing = c.execute(
+            "SELECT * FROM guest_memory WHERE tg_user_id=?", (tg_user_id,)
+        ).fetchone()
+        if existing:
+            mc = existing["message_count"] + 1
+            # Running average of sentiment
+            avg = existing["sentiment_avg"]
+            if sentiment_score is not None:
+                if avg is None:
+                    avg = sentiment_score
+                else:
+                    avg = (avg * existing["message_count"] + sentiment_score) / mc
+            fields = ["last_contact=?", "message_count=?"]
+            vals: list = [now, mc]
+            if avg is not None:
+                fields.append("sentiment_avg=?"); vals.append(avg)
+            if last_room:
+                fields.append("last_room=?"); vals.append(last_room)
+            if preferences is not None:
+                fields.append("preferences=?"); vals.append(_json.dumps(preferences))
+            if notes is not None:
+                fields.append("notes=?"); vals.append(notes)
+            if vip is not None:
+                fields.append("vip_flag=?"); vals.append(1 if vip else 0)
+            vals.append(tg_user_id)
+            c.execute(f"UPDATE guest_memory SET {', '.join(fields)} WHERE tg_user_id=?", vals)
+        else:
+            c.execute(
+                "INSERT INTO guest_memory(tg_user_id, first_contact, last_contact, message_count, "
+                "stays_count, sentiment_avg, vip_flag, last_room, preferences, notes) "
+                "VALUES (?, ?, ?, 1, 0, ?, ?, ?, ?, ?)",
+                (tg_user_id, now, now,
+                 sentiment_score, 1 if vip else 0, last_room,
+                 _json.dumps(preferences) if preferences else None, notes),
+            )
+        row = c.execute("SELECT * FROM guest_memory WHERE tg_user_id=?", (tg_user_id,)).fetchone()
+        return dict(row)
+
+
+def get_guest_memory(tg_user_id: str) -> Optional[dict]:
+    with _conn() as c:
+        row = c.execute("SELECT * FROM guest_memory WHERE tg_user_id=?", (tg_user_id,)).fetchone()
+        return dict(row) if row else None
+
+
+def bump_guest_stays(tg_user_id: str) -> None:
+    with _conn() as c:
+        c.execute("UPDATE guest_memory SET stays_count = stays_count + 1 WHERE tg_user_id=?",
+                  (tg_user_id,))
+
+
+def remember_room(
+    room_number: str,
+    *,
+    occupied: Optional[bool] = None,
+    current_guest_tg: Optional[str] = None,
+    last_checkout: Optional[int] = None,
+    last_service: Optional[int] = None,
+    open_wos_delta: int = 0,
+    complaint: bool = False,
+) -> dict:
+    now = int(time.time())
+    with _conn() as c:
+        existing = c.execute("SELECT * FROM room_memory WHERE room_number=?",
+                             (room_number,)).fetchone()
+        if existing:
+            fields = []
+            vals: list = []
+            if occupied is not None:
+                fields.append("occupied=?"); vals.append(1 if occupied else 0)
+            if current_guest_tg is not None:
+                fields.append("current_guest_tg=?"); vals.append(current_guest_tg)
+            if last_checkout is not None:
+                fields.append("last_checkout=?"); vals.append(last_checkout)
+            if last_service is not None:
+                fields.append("last_service=?"); vals.append(last_service)
+            if open_wos_delta:
+                fields.append("open_wos=open_wos+?"); vals.append(open_wos_delta)
+            if complaint:
+                fields.append("complaints_count=complaints_count+1")
+            if fields:
+                vals.append(room_number)
+                c.execute(f"UPDATE room_memory SET {', '.join(fields)} WHERE room_number=?", vals)
+        else:
+            c.execute(
+                "INSERT INTO room_memory(room_number, occupied, current_guest_tg, last_checkout, "
+                "last_service, open_wos, complaints_count) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?)",
+                (room_number, 1 if occupied else 0, current_guest_tg,
+                 last_checkout, last_service, max(0, open_wos_delta), 1 if complaint else 0),
+            )
+        row = c.execute("SELECT * FROM room_memory WHERE room_number=?", (room_number,)).fetchone()
+        return dict(row)
+
+
+def get_room_memory(room_number: str) -> Optional[dict]:
+    with _conn() as c:
+        row = c.execute("SELECT * FROM room_memory WHERE room_number=?",
+                        (room_number,)).fetchone()
+        return dict(row) if row else None
+
+
 # ---- workflow events --------------------------------------------------------
 
 def log_event(
@@ -397,6 +557,24 @@ def list_events_for_issue(issue_id: str) -> list[dict]:
             (issue_id, issue_id),
         ).fetchall()
         return [dict(r) for r in rows]
+
+
+def search_events(query: str, limit: int = 20) -> list[dict]:
+    """Full-text search across workflow events."""
+    if not query:
+        return []
+    # Escape FTS5 special chars by quoting
+    q = '"' + query.replace('"', '') + '"'
+    with _conn() as c:
+        try:
+            rows = c.execute(
+                "SELECT e.* FROM workflow_events e JOIN workflow_events_fts f ON e.id = f.rowid "
+                "WHERE workflow_events_fts MATCH ? ORDER BY e.ts DESC LIMIT ?",
+                (q, limit),
+            ).fetchall()
+            return [dict(r) for r in rows]
+        except Exception:
+            return []
 
 
 def events_since(since_ts: int) -> list[dict]:
