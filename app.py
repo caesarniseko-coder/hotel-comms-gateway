@@ -275,7 +275,22 @@ async def telegram_webhook(
 ) -> JSONResponse:
     if TG_SECRET and x_telegram_bot_api_secret_token != TG_SECRET:
         raise HTTPException(status_code=401, detail="bad telegram secret")
-    update = await request.json()
+    try:
+        return await _handle_telegram_update(await request.json())
+    except Exception as exc:
+        import traceback
+        tb = traceback.format_exc()
+        log.exception("telegram webhook failed: %s", exc)
+        # Return 200 so Telegram doesn't retry — but expose error for debugging
+        return JSONResponse({
+            "ok": False,
+            "error": type(exc).__name__,
+            "detail": str(exc)[:600],
+            "tb": tb.splitlines()[-6:],
+        })
+
+
+async def _handle_telegram_update(update: dict) -> JSONResponse:
     parsed = telegram.parse_update(update)
     if not parsed:
         return JSONResponse({"ok": True, "skipped": True})
