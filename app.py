@@ -32,6 +32,8 @@ import world
 log = logging.getLogger("app")
 
 _META_RE = re.compile(r"<!--\s*comms-meta:\s*(\{.*?\})\s*-->", re.DOTALL)
+_STATUS_RE = re.compile(r"^\s*STATUS:\s*.*$", re.MULTILINE | re.IGNORECASE)
+_HANDOFF_LINE_RE = re.compile(r"^\s*@HANDOFF:\s*.*$", re.MULTILINE | re.IGNORECASE)
 
 
 def _extract_meta(text: str) -> dict[str, Any]:
@@ -48,6 +50,16 @@ def _extract_meta(text: str) -> dict[str, Any]:
 
 def _strip_meta(text: str) -> str:
     return _META_RE.sub("", text or "").strip()
+
+
+def _strip_for_guest(text: str) -> str:
+    """Remove internal workflow markers before relaying to a real human channel."""
+    t = _strip_meta(text or "")
+    t = _STATUS_RE.sub("", t)
+    t = _HANDOFF_LINE_RE.sub("", t)
+    # Collapse multiple blank lines
+    t = re.sub(r"\n{3,}", "\n\n", t).strip()
+    return t
 
 
 GUEST_PROJECT_ID = os.environ["PAPERCLIP_GUEST_PROJECT_ID"]
@@ -91,25 +103,30 @@ async def _admin_mirror(text: str) -> None:
 
 
 async def _dispatch_to_channel(channel: str, to: str, body: str) -> None:
-    """Outbound dispatcher used by the poller for *guest* channels."""
+    """Outbound dispatcher used by the poller for *guest* channels.
+
+    `body` arrives already stripped of comms-meta. For guest channels we strip
+    additional internal markers (STATUS:, @HANDOFF:) so the guest sees a clean
+    natural-language reply.
+    """
     channel = (channel or "").lower()
     if channel == "telegram":
-        await STAFF_BOT.send(to=to, text=body)
+        await STAFF_BOT.send(to=to, text=_strip_for_guest(body))
     elif channel == "telegram_guest":
-        # Reply to the guest via the GUEST bot
-        await GUEST_BOT.send(to=to, text=body)
-        # Mirror reply to admin
+        clean = _strip_for_guest(body)
+        await GUEST_BOT.send(to=to, text=clean)
+        # Mirror reply to admin (also clean — admin sees what the guest sees)
         room = store.get_room_for_guest(to) or {}
         room_label = f"Room {room.get('room_number')}" if room.get("room_number") else f"tg:{to}"
         guest_name = room.get("guest_name") or "guest"
-        await _admin_mirror(f"🛏 {room_label} ({guest_name}) ← Concierge:\n{body[:1200]}")
+        await _admin_mirror(f"🛏 {room_label} ({guest_name}) ← Concierge:\n{clean[:1200]}")
     elif channel == "email":
-        await email_brevo.send(to=to, text=body)
+        await email_brevo.send(to=to, text=_strip_for_guest(body))
     elif channel == "slack":
-        await slack.send(to=to, text=body)
+        await slack.send(to=to, text=_strip_for_guest(body))
     elif channel == "web":
         async with _web_lock:
-            _web_inbox[to].append(body)
+            _web_inbox[to].append(_strip_for_guest(body))
     elif channel == "telegram_staff":
         # Handled by send_workspace path; ignore here.
         return
