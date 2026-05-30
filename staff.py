@@ -131,17 +131,30 @@ def claim_admin(tg_user_id: str) -> bool:
     return True
 
 
-def admin_user_id() -> Optional[str]:
-    return store.kv_get(_BOOTSTRAP_KEY)
+def _env_admins() -> set[str]:
+    """Comma-separated list of Telegram user IDs from BOOTSTRAP_ADMIN_TG_USER_IDS."""
+    import os
+    raw = os.environ.get("BOOTSTRAP_ADMIN_TG_USER_IDS", "")
+    return {x.strip() for x in raw.split(",") if x.strip()}
 
 
 def is_admin(tg_user_id: str) -> bool:
     if not tg_user_id:
         return False
+    if tg_user_id in _env_admins():
+        return True
     if admin_user_id() == tg_user_id:
         return True
-    staff = store.get_staff_by_tg_user(tg_user_id)
-    return bool(staff and staff.get("is_admin"))
+    staff_row = store.get_staff_by_tg_user(tg_user_id)
+    return bool(staff_row and staff_row.get("is_admin"))
+
+
+def admin_user_id() -> "Optional[str]":  # type: ignore[override]
+    # Hardcoded admin from env wins, otherwise the bootstrap-claimed one in DB
+    envs = _env_admins()
+    if envs:
+        return sorted(envs)[0]
+    return store.kv_get(_BOOTSTRAP_KEY)
 
 
 # ---- formatting helpers -----------------------------------------------------
