@@ -1,11 +1,13 @@
 """Hotel Comms Gateway — FastAPI app.
 
-Bridges Telegram / Email / Slack / Web ↔ Paperclip ↔ Grand Hotel agents.
+Bridges Telegram (staff workspace + guest channel), Email, Slack, and Web ↔
+Paperclip ↔ Grand Hotel agents.
 """
 from __future__ import annotations
 
 import asyncio
 import json
+import logging
 import os
 import re
 import time
@@ -16,10 +18,15 @@ from fastapi import FastAPI, Header, HTTPException, Request
 from fastapi.responses import JSONResponse, PlainTextResponse
 
 from adapters import telegram, email_brevo, slack, web
+import agent_listener
 import classifier
+import commands
 import paperclip_client as pc
 import poller
+import staff
 import store
+
+log = logging.getLogger("app")
 
 _META_RE = re.compile(r"<!--\s*comms-meta:\s*(\{.*?\})\s*-->", re.DOTALL)
 
@@ -39,6 +46,7 @@ def _extract_meta(text: str) -> dict[str, Any]:
 def _strip_meta(text: str) -> str:
     return _META_RE.sub("", text or "").strip()
 
+
 GUEST_PROJECT_ID = os.environ["PAPERCLIP_GUEST_PROJECT_ID"]
 STAFF_PROJECT_ID = os.environ.get("PAPERCLIP_STAFF_PROJECT_ID", GUEST_PROJECT_ID)
 TG_SECRET = os.environ.get("TG_SECRET", "")
@@ -46,12 +54,16 @@ BREVO_INBOUND_SECRET = os.environ.get("BREVO_INBOUND_SECRET", "")
 
 app = FastAPI(title="Hotel Comms Gateway")
 
-
 _poller_task: asyncio.Task | None = None
+_bot_username: str | None = None
+
+# In-memory queue keyed by sessionId for the web channel /api/web/poll.
+_web_inbox: dict[str, deque[str]] = defaultdict(deque)
+_web_lock = asyncio.Lock()
 
 
 async def _dispatch_to_channel(channel: str, to: str, body: str) -> None:
-    """Outbound dispatcher used by the poller."""
+    """Outbound dispatcher used by the poller for *guest* channels."""
     channel = (channel or "").lower()
     if channel == "telegram":
         await telegram.send(to=to, text=body)
@@ -62,15 +74,49 @@ async def _dispatch_to_channel(channel: str, to: str, body: str) -> None:
     elif channel == "web":
         async with _web_lock:
             _web_inbox[to].append(body)
+    elif channel == "telegram_staff":
+        # Handled by send_workspace path; ignore here.
+        return
     else:
         raise ValueError(f"unknown channel {channel}")
 
 
+async def _dispatch_workspace(origin: dict, body: str) -> None:
+    """Relay an agent comment from a workspace issue back to staff."""
+    chat_id = origin.get("tg_chat_id")
+    if not chat_id:
+        return
+    # Prefix with a context line so staff know what's happening
+    dept = origin.get("department")
+    label = staff.dept_label(dept) if dept else "Manager"
+    prefix = f"💬 *{label} →*\n"
+    await telegram.send(to=str(chat_id), text=prefix + body)
+
+    # If the issue originated from a staff member's DM (not a group), also
+    # post in the dept group for visibility.
+    if origin.get("origin_kind") == "staff_report" and dept:
+        group_chat = store.get_chat_for_dept(dept)
+        if group_chat and str(group_chat) != str(chat_id):
+            try:
+                await telegram.send(to=str(group_chat), text=prefix + body)
+            except Exception as exc:
+                log.warning("workspace dispatch: dept group post failed: %s", exc)
+
+
 @app.on_event("startup")
 async def _startup() -> None:
-    global _poller_task
+    global _poller_task, _bot_username
     store.init()
-    _poller_task = asyncio.create_task(poller.run_loop(_dispatch_to_channel))
+    # Cache the bot's @username for mention detection
+    try:
+        me = await telegram.get_me()
+        _bot_username = me.get("username")
+        log.info("telegram bot username: @%s", _bot_username)
+    except Exception as exc:
+        log.warning("get_me failed: %s", exc)
+    _poller_task = asyncio.create_task(
+        poller.run_loop(_dispatch_to_channel, send_workspace=_dispatch_workspace)
+    )
 
 
 @app.on_event("shutdown")
@@ -81,7 +127,12 @@ async def _shutdown() -> None:
 
 @app.get("/")
 async def root() -> dict[str, Any]:
-    return {"ok": True, "service": "hotel-comms-gateway"}
+    return {
+        "ok": True,
+        "service": "hotel-comms-gateway",
+        "bot": _bot_username,
+        "version": "staff-workspace-v1",
+    }
 
 
 @app.get("/health")
@@ -90,7 +141,7 @@ async def health() -> dict[str, Any]:
 
 
 # ---------------------------------------------------------------------------
-# Inbound: route a guest message to Paperclip
+# Guest-channel helper (web, email DM, telegram private DMs from non-staff)
 # ---------------------------------------------------------------------------
 
 async def _route_guest_message(
@@ -130,7 +181,92 @@ async def _route_guest_message(
     return {"issue_id": issue_id, "created": True, "intent": intent, "assignee": assignee}
 
 
-# --- Telegram --------------------------------------------------------------
+async def _route_group_message(
+    *,
+    chat: dict,
+    msg_from: dict,
+    text: str,
+    message_id: int | None,
+) -> dict[str, Any]:
+    """Active-participation: if a keyword/mention warrants it, route to the agent."""
+    chat_id = str(chat["id"])
+
+    # 1) If the chat is bound to a department, give that dept's agent priority
+    bound = store.get_dept_group(chat_id)
+    bound_dept = bound["department"] if bound else None
+
+    # 2) Decide whether/who responds
+    is_mention = agent_listener.is_mention(text, _bot_username or "")
+    dept, agent_name, priority = agent_listener.classify_by_keywords(text)
+
+    if is_mention and not agent_name and bound_dept:
+        agent_name = staff.dept_agent_for(bound_dept)
+        dept = bound_dept
+
+    if not agent_name and bound_dept and len(text.strip()) >= 80:
+        # Long messages in a bound dept group: use the dept's primary agent
+        agent_name = staff.dept_agent_for(bound_dept)
+        dept = bound_dept
+
+    if not agent_name:
+        return {"skipped": True, "reason": "no agent matched"}
+
+    # 3) Throttle per (chat, agent)
+    if not is_mention and not agent_listener.should_respond(
+        chat_id=chat_id, agent_name=agent_name, text=text
+    ):
+        return {"skipped": True, "reason": "throttled"}
+
+    sender = msg_from
+    sender_name = (
+        (sender.get("first_name") or "") + " " + (sender.get("last_name") or "")
+    ).strip() or sender.get("username") or f"tg:{sender.get('id')}"
+
+    s = store.get_staff_by_tg_user(str(sender.get("id")))
+    role_line = ""
+    if s and s.get("role_title"):
+        role_line = f" ({s['role_title']}, {staff.dept_label(s.get('department'))})"
+
+    title = f"[group:{chat.get('title') or chat_id}] {sender_name}{role_line}: {text[:60]}"
+    body = (
+        f"**Source:** Telegram group `{chat.get('title') or chat_id}`\n"
+        f"**Speaker:** {sender_name}{role_line}\n"
+        f"**Routed to:** {agent_name}"
+        + (f" ({staff.dept_label(dept)})" if dept else "")
+        + (f" — *priority {priority}*" if priority else "")
+        + f"\n\n---\n\n{text}"
+    )
+    issue = await pc.create_issue(
+        project_id=STAFF_PROJECT_ID,
+        title=title,
+        body=body,
+        assignee_slug=agent_name,
+        channel="telegram_staff",
+        to=chat_id,
+        priority=priority,
+        extra_metadata={
+            "reporter_name": sender_name,
+            "reporter_tg_user_id": str(sender.get("id")),
+            "routed_dept": dept,
+            "from_group_message": True,
+            "message_id": message_id,
+        },
+    )
+    issue_id = str(issue.get("id") or "")
+    if issue_id:
+        store.set_issue_origin(
+            issue_id=issue_id,
+            origin_kind="staff_group",
+            tg_chat_id=chat_id,
+            tg_user_id=str(sender.get("id")),
+            department=dept,
+        )
+    return {"created": True, "issue_id": issue_id, "agent": agent_name, "dept": dept}
+
+
+# ---------------------------------------------------------------------------
+# Telegram webhook
+# ---------------------------------------------------------------------------
 
 @app.post("/webhook/telegram")
 async def telegram_webhook(
@@ -145,14 +281,68 @@ async def telegram_webhook(
         return JSONResponse({"ok": True, "skipped": True})
     if parsed.get("update_id") and store.seen(f"tg:{parsed['update_id']}"):
         return JSONResponse({"ok": True, "duplicate": True})
+
+    chat = parsed["chat"]
+    chat_type = parsed["chat_type"]
+    msg_from = parsed["from"]
+    tg_user_id = str(msg_from.get("id"))
+    text = parsed["text"]
+
+    # --- 1) Slash commands -------------------------------------------------
+    if parsed["is_command"]:
+        try:
+            reply = await commands.dispatch(text=text, msg_from=msg_from, chat=chat)
+        except Exception as exc:
+            log.exception("command dispatch failed: %s", exc)
+            reply = f"⚠️ Command failed: `{type(exc).__name__}: {exc}`"
+        if reply:
+            await telegram.send(
+                to=parsed["to"],
+                text=reply,
+                reply_to_message_id=parsed["message_id"],
+                message_thread_id=parsed.get("message_thread_id"),
+            )
+        return JSONResponse({"ok": True, "handled": "command"})
+
+    # --- 2) Non-command in a group chat → active-listener route ----------
+    if chat_type in ("group", "supergroup"):
+        try:
+            result = await _route_group_message(
+                chat=chat,
+                msg_from=msg_from,
+                text=text,
+                message_id=parsed.get("message_id"),
+            )
+            return JSONResponse({"ok": True, "group": result})
+        except Exception as exc:
+            log.exception("group route failed: %s", exc)
+            return JSONResponse({"ok": False, "error": str(exc)[:300]})
+
+    # --- 3) Non-command in a DM ------------------------------------------
+    # If sender is a known staff member: treat as a "/report"-style report
+    s = store.get_staff_by_tg_user(tg_user_id)
+    if s and s.get("department"):
+        try:
+            # Reuse /report flow programmatically
+            reply = await commands.handle_report(
+                tg_user_id=tg_user_id, msg_from=msg_from, chat=chat, args=text
+            )
+        except Exception as exc:
+            reply = f"⚠️ Couldn't file: {exc}"
+        await telegram.send(
+            to=parsed["to"], text=reply, reply_to_message_id=parsed["message_id"]
+        )
+        return JSONResponse({"ok": True, "handled": "dm_report"})
+
+    # Unknown sender in DM → guest flow (existing behavior)
     result = await _route_guest_message(
         channel="telegram",
         sender_id=parsed["sender_id"],
         sender_name=parsed["sender_name"],
-        text=parsed["text"],
+        text=text,
         to=parsed["to"],
     )
-    return JSONResponse({"ok": True, **result})
+    return JSONResponse({"ok": True, "handled": "guest", **result})
 
 
 # --- Brevo email -----------------------------------------------------------
@@ -181,7 +371,7 @@ async def brevo_webhook(
     return JSONResponse({"ok": True, **result})
 
 
-# --- Slack staff side ------------------------------------------------------
+# --- Slack ------------------------------------------------------------------
 
 @app.post("/slack/command")
 async def slack_command(request: Request) -> PlainTextResponse:
@@ -194,7 +384,6 @@ async def slack_command(request: Request) -> PlainTextResponse:
     parsed = slack.parse_command(form)
     if not parsed:
         return PlainTextResponse("Usage: `/ask <agent-slug> <message>`")
-    # Create / append staff thread keyed by (channel, slug)
     channel = "slack"
     sender_key = f"{parsed['to']}::{parsed['agent_slug']}"
     issue_id = store.get_issue_id(channel, sender_key)
@@ -219,12 +408,7 @@ async def slack_command(request: Request) -> PlainTextResponse:
     return PlainTextResponse(f":memo: Routed to *{parsed['agent_slug']}*. Reply will appear here.")
 
 
-# --- Web chat --------------------------------------------------------------
-
-# In-memory queue keyed by sessionId for /api/web/poll.
-_web_inbox: dict[str, deque[str]] = defaultdict(deque)
-_web_lock = asyncio.Lock()
-
+# --- Web chat ---------------------------------------------------------------
 
 @app.get("/api/web/token")
 async def web_token(session_id: str) -> dict[str, Any]:
@@ -263,9 +447,7 @@ async def web_poll(session_id: str, token: str = "") -> dict[str, Any]:
     return {"messages": msgs}
 
 
-# ---------------------------------------------------------------------------
-# Outbound: Paperclip → channel
-# ---------------------------------------------------------------------------
+# --- Outbound (Paperclip → channel) — webhook fallback ----------------------
 
 @app.post("/webhook/paperclip")
 async def paperclip_webhook(request: Request) -> dict[str, Any]:

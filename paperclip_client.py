@@ -130,3 +130,57 @@ async def add_comment(
 
 async def get_issue(issue_id: str) -> dict[str, Any]:
     return await _request("GET", f"/api/issues/{issue_id}")
+
+
+async def list_issues(
+    *,
+    assignee_agent_id: str | None = None,
+    project_id: str | None = None,
+    status: str | None = None,
+    limit: int = 25,
+) -> list[dict[str, Any]]:
+    params: dict[str, str] = {"limit": str(limit)}
+    if assignee_agent_id:
+        params["assigneeAgentId"] = assignee_agent_id
+    if project_id:
+        params["projectId"] = project_id
+    if status:
+        params["status"] = status
+    data = await _request("GET", f"/api/companies/{COMPANY_ID}/issues", params=params)
+    return data if isinstance(data, list) else data.get("items") or []
+
+
+async def list_issues_by_agent_name(name: str, **kwargs) -> list[dict[str, Any]]:
+    aid = await slug_to_id(name)
+    return await list_issues(assignee_agent_id=aid, **kwargs)
+
+
+async def update_issue(issue_id: str, fields: dict[str, Any]) -> dict[str, Any]:
+    return await _request("PATCH", f"/api/issues/{issue_id}", json_body=fields)
+
+
+async def set_issue_status(issue_id: str, status: str) -> dict[str, Any]:
+    return await update_issue(issue_id, {"status": status})
+
+
+async def reassign_issue(issue_id: str, agent_name: str) -> dict[str, Any]:
+    aid = await slug_to_id(agent_name)
+    return await update_issue(issue_id, {"assigneeAgentId": aid})
+
+
+# ---- project lookup ---------------------------------------------------------
+
+_projects_cache: dict[str, str] = {}
+_projects_lock = asyncio.Lock()
+
+
+async def project_id_by_name(name: str) -> str | None:
+    """Map project name (case-insensitive) → id. Cached for the lifetime of the process."""
+    async with _projects_lock:
+        if not _projects_cache:
+            data = await _request("GET", f"/api/companies/{COMPANY_ID}/projects")
+            items = data if isinstance(data, list) else data.get("items", [])
+            for p in items:
+                if p.get("name") and p.get("id"):
+                    _projects_cache[p["name"].lower()] = p["id"]
+    return _projects_cache.get(name.lower())

@@ -74,9 +74,14 @@ def _ts(c: dict[str, Any]) -> int:
     return 0
 
 
-async def _poll_once(send_to_channel: Callable[[str, str, str], Awaitable[None]]) -> int:
-    """Walk tracked threads, dispatch any new agent comments. Returns # dispatched."""
+async def _poll_once(
+    send_to_channel: Callable[[str, str, str], Awaitable[None]],
+    send_workspace: Callable[[dict, str], Awaitable[None]] | None = None,
+) -> int:
+    """Walk tracked threads + workspace issues, dispatch new agent comments."""
     dispatched = 0
+
+    # 1) Guest-channel threads (existing behavior)
     rows = store.list_thread_map(updated_since_days=SESSION_TTL_DAYS)
     for channel, sender_id, issue_id in rows:
         try:
@@ -90,14 +95,12 @@ async def _poll_once(send_to_channel: Callable[[str, str, str], Awaitable[None]]
         comments = issue.get("comments") or []
         if not comments:
             comments = await _fetch_comments(issue_id)
-        key = (channel, sender_id)
+        key = ("guest", channel, sender_id)
         watermark = _high_water.get(key, 0)
         new_high = watermark
         for c in comments:
             ts = _ts(c)
-            if ts <= watermark:
-                continue
-            if not _is_agent_comment(c):
+            if ts <= watermark or not _is_agent_comment(c):
                 continue
             body = _strip_meta(c.get("body") or c.get("content") or "")
             if not body:
@@ -111,6 +114,42 @@ async def _poll_once(send_to_channel: Callable[[str, str, str], Awaitable[None]]
             if ts > new_high:
                 new_high = ts
         _high_water[key] = new_high
+
+    # 2) Workspace issues (staff-originated)
+    if send_workspace is not None:
+        origins = store.list_issue_origins(since_days=SESSION_TTL_DAYS)
+        for o in origins:
+            if o["origin_kind"] not in ("staff_report", "staff_dm", "staff_group", "ask"):
+                continue
+            issue_id = o["issue_id"]
+            try:
+                issue = await pc.get_issue(issue_id)
+            except Exception as exc:
+                log.warning("poller: get_issue %s failed (%s)", issue_id, exc)
+                continue
+            comments = issue.get("comments") or []
+            if not comments:
+                comments = await _fetch_comments(issue_id)
+            key = ("ws", issue_id)
+            watermark = _high_water.get(key, 0)
+            new_high = watermark
+            for c in comments:
+                ts = _ts(c)
+                if ts <= watermark or not _is_agent_comment(c):
+                    continue
+                body = _strip_meta(c.get("body") or c.get("content") or "")
+                if not body:
+                    continue
+                try:
+                    await send_workspace(o, body)
+                    dispatched += 1
+                except Exception as exc:
+                    log.warning("poller: workspace dispatch failed for issue %s: %s", issue_id, exc)
+                    continue
+                if ts > new_high:
+                    new_high = ts
+            _high_water[key] = new_high
+
     return dispatched
 
 
@@ -123,12 +162,15 @@ async def _fetch_comments(issue_id: str) -> list[dict[str, Any]]:
         return []
 
 
-async def run_loop(send_to_channel: Callable[[str, str, str], Awaitable[None]]) -> None:
+async def run_loop(
+    send_to_channel: Callable[[str, str, str], Awaitable[None]],
+    send_workspace: Callable[[dict, str], Awaitable[None]] | None = None,
+) -> None:
     log.info("poller starting (interval=%ss)", POLL_INTERVAL_SECONDS)
     while True:
         start = time.time()
         try:
-            n = await _poll_once(send_to_channel)
+            n = await _poll_once(send_to_channel, send_workspace=send_workspace)
             if n:
                 log.info("poller dispatched %d comments", n)
         except Exception as exc:
