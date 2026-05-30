@@ -25,6 +25,7 @@ import paperclip_client as pc
 import poller
 import staff
 import store
+import world
 
 log = logging.getLogger("app")
 
@@ -199,6 +200,13 @@ async def _startup() -> None:
     _poller_task = asyncio.create_task(
         poller.run_loop(_dispatch_to_channel, send_workspace=_dispatch_workspace)
     )
+    # If the world driver was running before a restart, resume it
+    try:
+        if world.is_running():
+            await world.start_day()
+            log.info("world driver auto-resumed (was running before restart)")
+    except Exception as exc:
+        log.warning("world driver auto-resume failed: %s", exc)
 
 
 @app.on_event("shutdown")

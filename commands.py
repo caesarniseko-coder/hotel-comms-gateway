@@ -14,6 +14,7 @@ import autonomy
 import paperclip_client as pc
 import staff
 import store
+import world
 
 log = logging.getLogger("commands")
 
@@ -84,10 +85,14 @@ async def handle_help() -> str:
         "• `/status` — department snapshot\n\n"
         "*AI managers*\n"
         "• `/ask <Agent> <question>` — ping a manager (GM, DOR, Chief Engineer…)\n\n"
+        "*Autonomous operations* (admin)\n"
+        "• `/start_day` — begin the autonomous operating day (events fire continuously)\n"
+        "• `/stop_day` — halt the autonomous loop\n"
+        "• `/world` — show current world state (occupancy, ADR, recent events)\n"
+        "• `/seed_day` — re-seed daily standing tasks\n\n"
         "*Group setup* (admin)\n"
         "• `/dept <slug>` — bind this Telegram group to a department\n"
-        "• `/register @user <role>` — assign a role to a colleague\n"
-        "• `/seed_day` — kick off today's autonomous ops cycle"
+        "• `/register @user <role>` — assign a role to a colleague"
     )
 
 
@@ -421,6 +426,65 @@ async def handle_status(tg_user_id: str, chat: dict) -> str:
     return "\n".join(lines)
 
 
+async def handle_start_day(tg_user_id: str, args: str) -> str:
+    if not staff.is_admin(tg_user_id):
+        return "🔒 Admin only."
+    # Make sure standing seeds exist
+    seed_result = await autonomy.seed_day(force=False)
+    started = await world.start_day()
+    s = world.get_state()
+    if started.get("already_running"):
+        return (
+            f"☀️ The day is already running.\n"
+            f"World clock: {s['world_hour']:02d}:{s['world_minute']:02d}, "
+            f"occupancy {int(s['occupancy']*100)}%, ADR ${s['adr']:.0f}.\n"
+            f"Use /stop_day to halt or /world to inspect."
+        )
+    return (
+        f"🌅 *Operating day STARTED*\n"
+        f"World tick: every {started.get('tick_seconds')}s (real) = +30 min world time.\n"
+        f"Synthetic events will start firing into your agents' issues. "
+        f"You'll see pulses cascading into this chat as agents react.\n\n"
+        f"Run /stop_day to halt. /world to inspect current state."
+    )
+
+
+async def handle_stop_day(tg_user_id: str, args: str) -> str:
+    if not staff.is_admin(tg_user_id):
+        return "🔒 Admin only."
+    result = await world.stop_day()
+    if result.get("already_stopped"):
+        return "🌙 The day is already stopped."
+    return (
+        "🌙 *Operating day STOPPED*\n"
+        "World driver halted. Heartbeats remain enabled but no new events will "
+        "be injected. Restart with /start_day."
+    )
+
+
+async def handle_world(tg_user_id: str) -> str:
+    s = world.get_state()
+    log_lines = ""
+    log_items = s.get("events_log") or []
+    if log_items:
+        log_lines = "\n\nRecent events:\n" + "\n".join(
+            f"  • {e.get('agent','?')}: {e.get('headline','?')}" for e in log_items[-8:]
+        )
+    return (
+        f"🏨 *Grand Hotel — world state*\n\n"
+        f"Driver: {'🟢 RUNNING' if s.get('running') else '🔴 STOPPED'}\n"
+        f"Day: {s.get('day_index', 1)}\n"
+        f"World time: {s['world_hour']:02d}:{s['world_minute']:02d}\n"
+        f"Occupancy: {int(s['occupancy']*100)}%\n"
+        f"ADR: ${s['adr']:.0f}\n"
+        f"Pickup 24h: {s['pickup_24h']}\n"
+        f"OOO rooms: {s['ooo_count']}\n"
+        f"Open WOs: {s['open_wos']}\n"
+        f"Incidents today: {s.get('incidents_today', 0)}"
+        f"{log_lines}"
+    )
+
+
 async def handle_seed_day(tg_user_id: str, args: str) -> str:
     if not staff.is_admin(tg_user_id):
         return "🔒 Admin only."
@@ -503,4 +567,10 @@ async def dispatch(*, text: str, msg_from: dict, chat: dict) -> Optional[str]:
         return await handle_register(tg_user_id, args)
     if cmd in ("seed_day", "seedday", "seed"):
         return await handle_seed_day(tg_user_id, args)
+    if cmd in ("start_day", "startday", "go", "begin"):
+        return await handle_start_day(tg_user_id, args)
+    if cmd in ("stop_day", "stopday", "halt", "pause"):
+        return await handle_stop_day(tg_user_id, args)
+    if cmd in ("world", "state", "snapshot"):
+        return await handle_world(tg_user_id)
     return None  # unknown command — caller decides whether to ignore
