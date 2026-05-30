@@ -67,6 +67,17 @@ def set_issue_id(channel: str, sender_id: str, issue_id: str) -> None:
         )
 
 
+def list_thread_map(updated_since_days: int = 14) -> list[tuple[str, str, str]]:
+    """Return [(channel, sender_id, issue_id), ...] for threads created in the window."""
+    cutoff = int(time.time()) - updated_since_days * 86400
+    with _conn() as c:
+        rows = c.execute(
+            "SELECT channel, sender_id, issue_id FROM thread_map WHERE created_at >= ?",
+            (cutoff,),
+        ).fetchall()
+        return [(r["channel"], r["sender_id"], r["issue_id"]) for r in rows]
+
+
 def seen(key: str, ttl_seconds: int = 7 * 86400) -> bool:
     """Return True if `key` was already seen. Otherwise mark and return False."""
     now = int(time.time())

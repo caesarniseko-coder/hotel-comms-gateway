@@ -18,6 +18,7 @@ from fastapi.responses import JSONResponse, PlainTextResponse
 from adapters import telegram, email_brevo, slack, web
 import classifier
 import paperclip_client as pc
+import poller
 import store
 
 _META_RE = re.compile(r"<!--\s*comms-meta:\s*(\{.*?\})\s*-->", re.DOTALL)
@@ -46,9 +47,36 @@ BREVO_INBOUND_SECRET = os.environ.get("BREVO_INBOUND_SECRET", "")
 app = FastAPI(title="Hotel Comms Gateway")
 
 
+_poller_task: asyncio.Task | None = None
+
+
+async def _dispatch_to_channel(channel: str, to: str, body: str) -> None:
+    """Outbound dispatcher used by the poller."""
+    channel = (channel or "").lower()
+    if channel == "telegram":
+        await telegram.send(to=to, text=body)
+    elif channel == "email":
+        await email_brevo.send(to=to, text=body)
+    elif channel == "slack":
+        await slack.send(to=to, text=body)
+    elif channel == "web":
+        async with _web_lock:
+            _web_inbox[to].append(body)
+    else:
+        raise ValueError(f"unknown channel {channel}")
+
+
 @app.on_event("startup")
 async def _startup() -> None:
+    global _poller_task
     store.init()
+    _poller_task = asyncio.create_task(poller.run_loop(_dispatch_to_channel))
+
+
+@app.on_event("shutdown")
+async def _shutdown() -> None:
+    if _poller_task:
+        _poller_task.cancel()
 
 
 @app.get("/")
