@@ -9,6 +9,9 @@ import logging
 import re
 from typing import Optional
 
+import json
+
+import guest_profile
 import store
 
 log = logging.getLogger("guest_commands")
@@ -82,17 +85,27 @@ async def handle_checkin(tg_user_id: str, msg_from: dict, args: str) -> str:
             f"Try e.g. `/checkin 408`."
         )
     name = parts[1].strip() if len(parts) > 1 else _display(msg_from)
+    profile = guest_profile.synthesize(tg_user_id=tg_user_id, name=name, room=room)
     rec = store.check_in_guest(
         tg_user_id=tg_user_id,
         room_number=room,
         guest_name=name,
-        tg_chat_id=tg_user_id,  # in DMs, chat_id == user_id
+        tg_chat_id=tg_user_id,
+        profile_json=json.dumps(profile),
+    )
+    nights = profile["nights"]
+    night_word = "night" if nights == 1 else "nights"
+    loyalty = profile.get("loyalty_tier")
+    loyalty_line = (
+        f"As a *{loyalty}-tier* guest, " if loyalty and loyalty != "None" else ""
     )
     return (
         f"✅ Checked into *Room {rec['room_number']}* — welcome, {name}!\n\n"
-        f"Just send any message now and our team will reply. "
-        f"You can ask about gym hours, request room service, report any issue, "
-        f"or get local recommendations. We're around the clock.\n\n"
+        f"{loyalty_line}your booking `{profile['booking_ref']}` is confirmed for "
+        f"{nights} {night_word} — check-out {profile['departure']}.\n"
+        f"Rate: ${profile['rate_per_night_usd']}/night ({profile['payment_status']}).\n\n"
+        f"Send any message now and our team will reply — restaurant bookings, "
+        f"room service, recommendations, anything. We're around the clock.\n\n"
         f"_(/checkout when you're leaving.)_"
     )
 

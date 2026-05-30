@@ -23,6 +23,7 @@ import agent_listener
 import classifier
 import commands
 import guest_commands
+import guest_profile
 import paperclip_client as pc
 import poller
 import staff
@@ -587,6 +588,16 @@ async def _handle_guest_update(update: dict) -> JSONResponse:
             reply = f"Something went wrong: {exc}"
         if reply:
             await GUEST_BOT.send(to=parsed["to"], text=reply)
+        # If this was a successful /checkin, mirror the profile card to admin
+        cmd_lower = text.strip().split(maxsplit=1)[0].lstrip("/").lower()
+        if cmd_lower.startswith("checkin"):
+            room = store.get_room_for_guest(tg_user_id)
+            if room and room.get("profile_json"):
+                try:
+                    profile = json.loads(room["profile_json"])
+                    await _admin_mirror(guest_profile.format_card(profile))
+                except Exception as exc:
+                    log.warning("admin checkin mirror failed: %s", exc)
         return JSONResponse({"ok": True, "handled": "guest_command"})
 
     # --- Free-form message: must be checked into a room --------------------
@@ -601,9 +612,19 @@ async def _handle_guest_update(update: dict) -> JSONResponse:
         )
         return JSONResponse({"ok": True, "handled": "checkin_prompt"})
 
-    # Mirror inbound to admin so they see what the guest is asking
+    # Mirror inbound to admin with profile snippet for context
+    profile_line = ""
+    if room.get("profile_json"):
+        try:
+            p = json.loads(room["profile_json"])
+            profile_line = (
+                f" — {p.get('loyalty_tier')} tier, {p.get('segment')}, "
+                f"night {1 + (0 if not p.get('check_in') else 0)} of {p.get('nights')}"
+            )
+        except Exception:
+            pass
     await _admin_mirror(
-        f"🛏 Room {room['room_number']} ({room.get('guest_name') or 'guest'}) →\n{text[:1200]}"
+        f"🛏 Room {room['room_number']} ({room.get('guest_name') or 'guest'}{profile_line}) →\n{text[:1200]}"
     )
 
     # Route to Paperclip (Guest Conversations project), classify + assign
@@ -627,12 +648,24 @@ async def _route_guest_room_message(
         (msg_from.get("first_name") or "") + " " + (msg_from.get("last_name") or "")
     ).strip() or f"Room {room['room_number']}"
 
+    # Pull the synthesized profile (set at /checkin) for agent context
+    profile = None
+    if room.get("profile_json"):
+        try:
+            profile = json.loads(room["profile_json"])
+        except Exception:
+            profile = None
+    profile_block = guest_profile.format_context(profile) if profile else ""
+
     # Thread continuity: same guest → same issue
     issue_id = store.get_issue_id("telegram_guest", tg_user_id)
     if issue_id:
+        comment_body = f"**{sender_name}** (Room {room['room_number']}):\n\n{text}"
+        if profile_block:
+            comment_body += f"\n\n_Guest context_: {profile_block}"
         await pc.add_comment(
             issue_id=issue_id,
-            body=f"**{sender_name}** (Room {room['room_number']}):\n\n{text}",
+            body=comment_body,
             author_kind="external",
             extra_metadata={"room": room["room_number"], "sender": sender_name},
         )
@@ -640,13 +673,16 @@ async def _route_guest_room_message(
 
     intent, assignee, priority = await classifier.classify(text)
     title = f"[Room {room['room_number']}] {sender_name}: {text[:60]}"
-    body = (
-        f"**Room:** {room['room_number']}\n"
-        f"**Guest:** {sender_name}\n"
-        f"**Channel:** telegram_guest\n"
-        f"**Intent:** {intent}\n\n"
-        f"---\n\n{text}"
-    )
+    body_parts = [
+        f"**Room:** {room['room_number']}",
+        f"**Guest:** {sender_name}",
+        f"**Channel:** telegram_guest",
+        f"**Intent:** {intent}",
+    ]
+    if profile_block:
+        body_parts.append(f"**Guest profile:** {profile_block}")
+    body = "\n".join(body_parts) + f"\n\n---\n\n{text}"
+
     issue = await pc.create_issue(
         project_id=GUEST_PROJECT_ID,
         title=title,
@@ -659,6 +695,7 @@ async def _route_guest_room_message(
             "room": room["room_number"],
             "guest_name": sender_name,
             "intent": intent,
+            "profile": profile,
         },
     )
     issue_id = str(issue.get("id") or "")

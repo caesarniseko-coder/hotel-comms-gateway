@@ -72,7 +72,8 @@ CREATE TABLE IF NOT EXISTS room_assignments (
     guest_name     TEXT,
     check_in_at    INTEGER NOT NULL,
     check_out_at   INTEGER,
-    tg_chat_id     TEXT
+    tg_chat_id     TEXT,
+    profile_json   TEXT
 );
 CREATE INDEX IF NOT EXISTS idx_room_active ON room_assignments(room_number) WHERE check_out_at IS NULL;
 """
@@ -284,14 +285,20 @@ def check_in_guest(
     room_number: str,
     guest_name: Optional[str] = None,
     tg_chat_id: Optional[str] = None,
+    profile_json: Optional[str] = None,
 ) -> dict:
     """Check a guest in. Idempotent — overwrites prior assignment."""
     now = int(time.time())
     with _conn() as c:
+        # Ensure profile_json column exists (migration for older DBs)
+        try:
+            c.execute("ALTER TABLE room_assignments ADD COLUMN profile_json TEXT")
+        except sqlite3.OperationalError:
+            pass
         c.execute(
-            "INSERT OR REPLACE INTO room_assignments(tg_user_id, room_number, guest_name, check_in_at, check_out_at, tg_chat_id) "
-            "VALUES (?, ?, ?, ?, NULL, ?)",
-            (tg_user_id, room_number, guest_name, now, tg_chat_id),
+            "INSERT OR REPLACE INTO room_assignments(tg_user_id, room_number, guest_name, check_in_at, check_out_at, tg_chat_id, profile_json) "
+            "VALUES (?, ?, ?, ?, NULL, ?, ?)",
+            (tg_user_id, room_number, guest_name, now, tg_chat_id, profile_json),
         )
         row = c.execute("SELECT * FROM room_assignments WHERE tg_user_id=?", (tg_user_id,)).fetchone()
         return dict(row)
