@@ -131,11 +131,23 @@ async def _dispatch_to_channel(channel: str, to: str, body: str) -> None:
         expected_room = room.get("room_number") or ""
         expected_name = room.get("guest_name") or ""
 
-        # VALIDATE — correct hallucinated room/name BEFORE guest sees it
+        # Pull the topic from the most recent issue meta
+        expected_topic = None
+        try:
+            issue_id_x = store.get_issue_id("telegram_guest", to)
+            if issue_id_x:
+                issue_x = await pc.get_issue(issue_id_x)
+                meta_x = issue_x.get("metadata") or _extract_meta(issue_x.get("description") or "")
+                expected_topic = (meta_x or {}).get("intent")
+        except Exception:
+            pass
+
+        # VALIDATE — correct hallucinated room/name + reject evasive content
         corrected, report = reply_validator.correct_reply(
             reply=clean,
             expected_name=expected_name,
             expected_room=expected_room,
+            expected_topic=expected_topic,
         )
 
         await GUEST_BOT.send(to=to, text=corrected)
@@ -162,6 +174,8 @@ async def _dispatch_to_channel(channel: str, to: str, body: str) -> None:
         mirror_text = f"🛏 {room_label} ({guest_name}) ← {agent_label}:\n{corrected[:1200]}"
         if report.get("changes"):
             mirror_text += f"\n_(🛠 auto-corrected: {', '.join(report['changes'])})_"
+        if report.get("warnings"):
+            mirror_text += f"\n_(⚠️ {', '.join(report['warnings'])})_"
         await _admin_mirror(mirror_text)
 
         if report.get("altered"):
@@ -868,6 +882,19 @@ async def _route_guest_room_message(
             f"the guest has been waiting and is checking again."
         )
 
+    # Detect topic intent for the STATE lock
+    quick_intent, _, _ = await classifier.classify(text)
+    state_lock = (
+        f"\n\n<STATE>\n"
+        f"  room: {room_no}\n"
+        f"  guest_name: {sender_name}\n"
+        f"  topic: {quick_intent}\n"
+        f"  channel: telegram_guest\n"
+        f"</STATE>\n"
+        f"FACT-CHECK: Your reply MUST use room={room_no} and name={sender_name}. "
+        f"The guest's topic is {quick_intent}. Do not change these."
+    )
+
     # Thread continuity: same guest → same issue
     existing_issue_id = store.get_issue_id("telegram_guest", tg_user_id)
     if existing_issue_id:
@@ -878,6 +905,7 @@ async def _route_guest_room_message(
             + "\n\nReply directly to the guest. "
             f"Use their actual name ({sender_name}) and their actual room number ({room_no}) — "
             f"do NOT invent any other name or room. Be brief, warm, and specific."
+            + state_lock
         )
         await pc.add_comment(
             issue_id=existing_issue_id,
@@ -912,7 +940,8 @@ async def _route_guest_room_message(
         payload={"text": text[:500]},
     )
 
-    # PIPELINE STAGE 1: classify intent
+    # PIPELINE STAGE 1: classify intent (reuse quick_intent if already classified)
+    intent, assignee, priority = quick_intent, None, None
     intent, assignee, priority = await classifier.classify(text)
     store.log_event(
         event_type="classified",
@@ -947,6 +976,7 @@ async def _route_guest_room_message(
         f"@HANDOFF: <Department> on its own line, after a brief acknowledgement to "
         f"the guest with an ETA. Always end with STATUS: in_review on its own line "
         f"(the system strips it before showing to the guest)."
+        + state_lock
     )
 
     issue = await pc.create_issue(
