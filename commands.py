@@ -520,6 +520,79 @@ async def handle_seed_day(tg_user_id: str, args: str) -> str:
     )
 
 
+async def handle_analytics(tg_user_id: str, args: str) -> str:
+    if not staff.is_admin(tg_user_id):
+        return "🔒 Admin only."
+    import time as _time
+    hours = 24
+    if args.strip().isdigit():
+        hours = int(args.strip())
+    since = int(_time.time()) - hours * 3600
+    summary = store.analytics_summary(since)
+
+    def _topn(d: dict, n: int = 6) -> str:
+        items = sorted(d.items(), key=lambda kv: -kv[1])[:n]
+        return ", ".join(f"{k}: {v}" for k, v in items) if items else "—"
+
+    avg = summary.get("avg_response_seconds")
+    avg_str = f"{avg:.1f}s" if avg is not None else "—"
+    return (
+        f"📊 *Analytics — last {hours}h*\n\n"
+        f"Events:\n"
+        f"  • Guest messages: *{summary['events_by_type'].get('guest_message', 0)}*\n"
+        f"  • Issues created: *{summary['events_by_type'].get('created', 0)}*\n"
+        f"  • Handoffs: *{summary['events_by_type'].get('handoff', 0)}*\n"
+        f"  • Agent replies: *{summary['events_by_type'].get('agent_reply', 0)}*\n"
+        f"  • Resolved: *{summary['events_by_type'].get('resolved', 0)}*\n\n"
+        f"Performance:\n"
+        f"  • Avg time-to-first-reply: *{avg_str}*\n"
+        f"  • Issues open / closed: *{summary['open_count']} / {summary['resolved_count']}*\n\n"
+        f"By intent: {_topn(summary['issues_by_intent'])}\n"
+        f"By department: {_topn(summary['issues_by_department'])}\n"
+        f"By agent: {_topn(summary['replies_by_agent'])}\n"
+        f"Top rooms (msgs): {_topn(summary['messages_by_room'])}"
+    )
+
+
+async def handle_events(tg_user_id: str, args: str) -> str:
+    if not staff.is_admin(tg_user_id):
+        return "🔒 Admin only."
+    issue_short = args.strip().split()[0] if args else ""
+    if not issue_short:
+        return "Usage: `/events <issue-id>` (8-char prefix works)"
+    # Resolve short id
+    issue_id = issue_short
+    if len(issue_short) < 32:
+        for o in store.list_issue_origins(since_days=30):
+            if o["issue_id"].lower().startswith(issue_short.lower()):
+                issue_id = o["issue_id"]
+                break
+    events = store.list_events_for_issue(issue_id)
+    if not events:
+        return f"No events for `{issue_short}`."
+    import datetime
+    lines = [f"*Timeline — issue `{issue_short}`* ({len(events)} events)\n"]
+    for e in events:
+        ts = datetime.datetime.fromtimestamp(e["ts"]).strftime("%H:%M:%S")
+        kind = e["event_type"]
+        actor = e.get("actor") or "?"
+        extra = ""
+        if kind == "classified":
+            try:
+                p = __import__("json").loads(e.get("payload") or "{}")
+                extra = f" → {p.get('agent')}"
+            except Exception:
+                pass
+        elif kind == "handoff":
+            try:
+                p = __import__("json").loads(e.get("payload") or "{}")
+                extra = f" → {p.get('to_agent')}"
+            except Exception:
+                pass
+        lines.append(f"  {ts}  *{kind}*  {actor}{extra}")
+    return "\n".join(lines)
+
+
 async def handle_rooms(tg_user_id: str) -> str:
     if not staff.is_admin(tg_user_id):
         return "🔒 Admin only."
@@ -666,4 +739,8 @@ async def dispatch(*, text: str, msg_from: dict, chat: dict) -> Optional[str]:
         return await handle_room(tg_user_id, args)
     if cmd in ("checkin_admin", "guest_checkin"):
         return await handle_checkin_admin(tg_user_id, args)
+    if cmd in ("analytics", "stats", "metrics"):
+        return await handle_analytics(tg_user_id, args)
+    if cmd in ("events", "timeline"):
+        return await handle_events(tg_user_id, args)
     return None  # unknown command — caller decides whether to ignore

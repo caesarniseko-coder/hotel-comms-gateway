@@ -38,7 +38,9 @@ KEYWORDS: list[tuple[re.Pattern, str, str, Optional[str]]] = [
     # f&b kitchen
     (re.compile(r"\b(menu|allergen|allerg\w*|dietary|halal|kosher|vegan|gluten|kitchen|chef|prep|cover|86\b|special meal)\b", re.I),
      staff.DEPT_FNB, "Exec Chef", None),
-    # f&b service / restaurant
+    # f&b service / restaurant / room service / food in general
+    (re.compile(r"\b(food|meal|hungry|snack|room service|in[- ]room dining|order|delivery|where('| i)s my (food|order|meal))\b", re.I),
+     staff.DEPT_FNB, "Restaurant Mgr", None),
     (re.compile(r"\b(restaurant|breakfast|lunch|dinner|bar|server|waiter|wine|cocktail|reservation book|cover count)\b", re.I),
      staff.DEPT_FNB, "Restaurant Mgr", None),
     # spa

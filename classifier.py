@@ -58,9 +58,35 @@ _LABEL_RE = re.compile(r"\b(" + "|".join(LABELS) + r")\b", re.I)
 
 
 async def classify(text: str) -> tuple[str, str, str | None]:
-    """Return (intent, assignee_slug, priority_or_None). Defaults to concierge on any failure."""
+    """Return (intent, assignee_slug, priority_or_None).
+
+    Tries keyword classification first (free, deterministic). If no keyword
+    matches, optionally calls the LLM classifier. Falls back to concierge.
+    """
+    import agent_listener
+    kw_dept, kw_agent, kw_pri = agent_listener.classify_by_keywords(text)
+    if kw_agent:
+        # Map dept slug → intent label for consistency
+        dept_to_intent = {
+            "rooms": "front_office", "fnb": "f_and_b", "engineering": "maintenance",
+            "commercial": "reservations", "management": "complaint_escalate",
+            "security": "security", "spa": "spa", "hr": "housekeeping",
+            "finance": "billing",
+        }
+        intent_label = dept_to_intent.get(kw_dept, "concierge")
+        # Refine FnB routing: pick Restaurant Mgr (room service) for food requests,
+        # Exec Chef only for menu/allergen/cooking questions.
+        if intent_label == "f_and_b":
+            t = (text or "").lower()
+            if any(k in t for k in ("allergen", "allerg", "menu", "ingredient", "vegan", "halal", "kosher", "gluten")):
+                kw_agent = "Exec Chef"
+            else:
+                kw_agent = "Restaurant Mgr"
+        log.info("classifier (keyword) → intent=%s agent=%s pri=%s", intent_label, kw_agent, kw_pri)
+        return intent_label, kw_agent, kw_pri
+
     if not GATEWAY_BASE_URL or not GATEWAY_API_KEY:
-        log.info("classifier disabled (no gateway creds) — defaulting to concierge")
+        log.info("classifier (no keyword match, no gateway) → concierge")
         return "concierge", ROUTE["concierge"], None
     body = {
         "model": CLASSIFIER_MODEL,

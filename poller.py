@@ -108,6 +108,17 @@ async def _poll_once(
             try:
                 await send_to_channel(meta["channel"], meta["to"], body)
                 dispatched += 1
+                try:
+                    store.log_event(
+                        event_type="agent_reply",
+                        issue_id=issue_id,
+                        actor=meta.get("agent_name") or "agent",
+                        actor_kind="agent",
+                        room_number=meta.get("room"),
+                        payload={"channel": channel, "body": body[:500]},
+                    )
+                except Exception as exc:
+                    log.warning("event log failed: %s", exc)
             except Exception as exc:
                 log.warning("poller: dispatch failed for %s/%s: %s", channel, sender_id, exc)
                 continue
@@ -157,6 +168,28 @@ async def _poll_once(
                 try:
                     await send_workspace(enriched, body)
                     dispatched += 1
+                    # log agent reply event
+                    try:
+                        store.log_event(
+                            event_type="agent_reply",
+                            issue_id=issue_id,
+                            actor=enriched.get("agent_name") or "agent",
+                            actor_kind="agent",
+                            department=enriched.get("department"),
+                            payload={"body": body[:500]},
+                        )
+                        # Detect STATUS markers in raw body (before strip)
+                        raw_body = c.get("body") or ""
+                        if "STATUS: done" in raw_body.lower() or "status: done" in raw_body.lower():
+                            store.log_event(
+                                event_type="resolved",
+                                issue_id=issue_id,
+                                actor=enriched.get("agent_name") or "agent",
+                                actor_kind="agent",
+                                department=enriched.get("department"),
+                            )
+                    except Exception as exc:
+                        log.warning("event log failed: %s", exc)
                 except Exception as exc:
                     log.warning("poller: workspace dispatch failed for issue %s: %s", issue_id, exc)
                     continue

@@ -65,6 +65,26 @@ CREATE TABLE IF NOT EXISTS issue_origin (
     created_at     INTEGER NOT NULL
 );
 
+-- Workflow events log — every transition timestamped for analytics
+CREATE TABLE IF NOT EXISTS workflow_events (
+    id             INTEGER PRIMARY KEY AUTOINCREMENT,
+    issue_id       TEXT,
+    parent_issue   TEXT,
+    event_type     TEXT NOT NULL,
+    actor          TEXT,
+    actor_kind     TEXT,
+    intent         TEXT,
+    department     TEXT,
+    priority       TEXT,
+    room_number    TEXT,
+    payload        TEXT,
+    ts             INTEGER NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_events_issue ON workflow_events(issue_id);
+CREATE INDEX IF NOT EXISTS idx_events_ts ON workflow_events(ts);
+CREATE INDEX IF NOT EXISTS idx_events_type ON workflow_events(event_type);
+CREATE INDEX IF NOT EXISTS idx_events_room ON workflow_events(room_number);
+
 -- Hotel-side: which Telegram guest user is currently in which room
 CREATE TABLE IF NOT EXISTS room_assignments (
     tg_user_id     TEXT PRIMARY KEY,
@@ -337,6 +357,100 @@ def list_active_rooms() -> list[dict]:
             "SELECT * FROM room_assignments WHERE check_out_at IS NULL ORDER BY check_in_at DESC"
         ).fetchall()
         return [dict(r) for r in rows]
+
+
+# ---- workflow events --------------------------------------------------------
+
+def log_event(
+    *,
+    event_type: str,
+    issue_id: Optional[str] = None,
+    parent_issue: Optional[str] = None,
+    actor: Optional[str] = None,
+    actor_kind: Optional[str] = None,
+    intent: Optional[str] = None,
+    department: Optional[str] = None,
+    priority: Optional[str] = None,
+    room_number: Optional[str] = None,
+    payload: Optional[dict] = None,
+) -> int:
+    import json as _json
+    with _conn() as c:
+        cur = c.execute(
+            "INSERT INTO workflow_events(issue_id, parent_issue, event_type, actor, actor_kind, "
+            "intent, department, priority, room_number, payload, ts) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            (
+                issue_id, parent_issue, event_type, actor, actor_kind,
+                intent, department, priority, room_number,
+                _json.dumps(payload, default=str) if payload is not None else None,
+                int(time.time()),
+            ),
+        )
+        return cur.lastrowid
+
+
+def list_events_for_issue(issue_id: str) -> list[dict]:
+    with _conn() as c:
+        rows = c.execute(
+            "SELECT * FROM workflow_events WHERE issue_id=? OR parent_issue=? ORDER BY ts ASC",
+            (issue_id, issue_id),
+        ).fetchall()
+        return [dict(r) for r in rows]
+
+
+def events_since(since_ts: int) -> list[dict]:
+    with _conn() as c:
+        rows = c.execute("SELECT * FROM workflow_events WHERE ts >= ? ORDER BY ts ASC",
+                         (since_ts,)).fetchall()
+        return [dict(r) for r in rows]
+
+
+def analytics_summary(since_ts: int) -> dict:
+    """Aggregate event counts + averages since a timestamp."""
+    with _conn() as c:
+        types = dict(c.execute(
+            "SELECT event_type, COUNT(*) FROM workflow_events WHERE ts>=? GROUP BY event_type",
+            (since_ts,)).fetchall())
+        intents = dict(c.execute(
+            "SELECT COALESCE(intent,'?'), COUNT(*) FROM workflow_events "
+            "WHERE ts>=? AND event_type='created' GROUP BY intent",
+            (since_ts,)).fetchall())
+        depts = dict(c.execute(
+            "SELECT COALESCE(department,'?'), COUNT(*) FROM workflow_events "
+            "WHERE ts>=? AND event_type='created' GROUP BY department",
+            (since_ts,)).fetchall())
+        agents = dict(c.execute(
+            "SELECT COALESCE(actor,'?'), COUNT(*) FROM workflow_events "
+            "WHERE ts>=? AND event_type='agent_reply' GROUP BY actor",
+            (since_ts,)).fetchall())
+        rooms = dict(c.execute(
+            "SELECT COALESCE(room_number,'?'), COUNT(*) FROM workflow_events "
+            "WHERE ts>=? AND event_type='guest_message' GROUP BY room_number",
+            (since_ts,)).fetchall())
+        # Resolution times — created → first agent_reply, per issue
+        rt_rows = c.execute(
+            "SELECT issue_id, MIN(ts) as t_create FROM workflow_events "
+            "WHERE event_type='created' AND ts>=? GROUP BY issue_id",
+            (since_ts,)).fetchall()
+        replied_rows = c.execute(
+            "SELECT issue_id, MIN(ts) as t_reply FROM workflow_events "
+            "WHERE event_type='agent_reply' AND ts>=? GROUP BY issue_id",
+            (since_ts,)).fetchall()
+        created_map = {r['issue_id']: r['t_create'] for r in rt_rows}
+        reply_map = {r['issue_id']: r['t_reply'] for r in replied_rows}
+        deltas = [reply_map[i] - created_map[i] for i in created_map if i in reply_map]
+        avg_resolution = (sum(deltas) / len(deltas)) if deltas else None
+        return {
+            "events_by_type": types,
+            "issues_by_intent": intents,
+            "issues_by_department": depts,
+            "replies_by_agent": agents,
+            "messages_by_room": rooms,
+            "avg_response_seconds": round(avg_resolution, 1) if avg_resolution is not None else None,
+            "resolved_count": len(deltas),
+            "open_count": max(0, len(created_map) - len(deltas)),
+        }
 
 
 # ---- idempotency ------------------------------------------------------------

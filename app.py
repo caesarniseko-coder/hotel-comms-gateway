@@ -231,7 +231,7 @@ async def _process_handoffs(*, origin: dict, body: str) -> None:
                     tg_user_id=None,
                     department=target_dept,
                 )
-            # Trace the handoff to admin
+            # Trace the handoff to admin + log event
             from_agent = origin.get("agent_name") or "Concierge"
             await _admin_mirror(
                 f"↪️ *Handoff* — {from_agent} → *{agent_name}* "
@@ -239,6 +239,20 @@ async def _process_handoffs(*, origin: dict, body: str) -> None:
                 f"Child issue `{(child_id or '?')[:8]}` created. "
                 f"{agent_name} will respond on next heartbeat."
             )
+            store.log_event(
+                event_type="handoff",
+                issue_id=child_id,
+                parent_issue=parent_issue_id,
+                actor=from_agent,
+                actor_kind="agent",
+                department=target_dept,
+                payload={"to_agent": agent_name},
+            )
+            # Wake the target agent immediately for fast cascades
+            try:
+                await pc.wake_agent(agent_name, reason="handoff")
+            except Exception as exc:
+                log.warning("wake on handoff failed: %s", exc)
         except Exception as exc:
             log.warning("handoff to %s failed: %s", target_dept, exc)
 
@@ -717,8 +731,26 @@ async def _route_guest_room_message(
         )
         return {"issue_id": existing_issue_id, "created": False}
 
+    # Log inbound guest message
+    store.log_event(
+        event_type="guest_message",
+        actor=sender_name,
+        actor_kind="guest",
+        room_number=room_no,
+        payload={"text": text[:500]},
+    )
+
     # PIPELINE STAGE 1: classify intent
     intent, assignee, priority = await classifier.classify(text)
+    store.log_event(
+        event_type="classified",
+        actor="classifier",
+        actor_kind="system",
+        intent=intent,
+        priority=priority,
+        room_number=room_no,
+        payload={"agent": assignee, "text": text[:200]},
+    )
     classifier_model = os.environ.get("CLASSIFIER_MODEL", "qwen3:8b-fast")
     pri_label = f" *priority {priority}*" if priority else ""
     await _admin_mirror(
@@ -756,6 +788,16 @@ async def _route_guest_room_message(
     issue_id = str(issue.get("id") or "")
     if issue_id:
         store.set_issue_id("telegram_guest", tg_user_id, issue_id)
+        store.log_event(
+            event_type="created",
+            issue_id=issue_id,
+            actor=assignee,
+            actor_kind="system",
+            intent=intent,
+            priority=priority,
+            room_number=room_no,
+            payload={"title": title[:200]},
+        )
 
     # PIPELINE STAGE 3: issue posted to Paperclip board
     company_id = os.environ.get("PAPERCLIP_COMPANY_ID", "")
