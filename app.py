@@ -222,6 +222,14 @@ async def _process_handoffs(*, origin: dict, body: str) -> None:
                     tg_user_id=None,
                     department=target_dept,
                 )
+            # Trace the handoff to admin
+            from_agent = origin.get("agent_name") or "Concierge"
+            await _admin_mirror(
+                f"↪️ *Handoff* — {from_agent} → *{agent_name}* "
+                f"({staff.dept_label(target_dept)}). "
+                f"Child issue `{(child_id or '?')[:8]}` created. "
+                f"{agent_name} will respond on next heartbeat."
+            )
         except Exception as exc:
             log.warning("handoff to %s failed: %s", target_dept, exc)
 
@@ -642,13 +650,16 @@ async def _route_guest_room_message(
     msg_from: dict,
     text: str,
 ) -> dict[str, Any]:
-    """Create/append a Paperclip issue for a guest message, assigned by intent."""
+    """Create/append a Paperclip issue for a guest message, assigned by intent.
+    Emits pipeline trace events to the admin mirror so the admin sees the whole flow.
+    """
     tg_user_id = str(msg_from.get("id"))
     sender_name = room.get("guest_name") or (
         (msg_from.get("first_name") or "") + " " + (msg_from.get("last_name") or "")
     ).strip() or f"Room {room['room_number']}"
+    room_no = room["room_number"]
 
-    # Pull the synthesized profile (set at /checkin) for agent context
+    # Pull the synthesized profile for agent context
     profile = None
     if room.get("profile_json"):
         try:
@@ -658,23 +669,36 @@ async def _route_guest_room_message(
     profile_block = guest_profile.format_context(profile) if profile else ""
 
     # Thread continuity: same guest → same issue
-    issue_id = store.get_issue_id("telegram_guest", tg_user_id)
-    if issue_id:
-        comment_body = f"**{sender_name}** (Room {room['room_number']}):\n\n{text}"
+    existing_issue_id = store.get_issue_id("telegram_guest", tg_user_id)
+    if existing_issue_id:
+        comment_body = f"**{sender_name}** (Room {room_no}):\n\n{text}"
         if profile_block:
             comment_body += f"\n\n_Guest context_: {profile_block}"
         await pc.add_comment(
-            issue_id=issue_id,
+            issue_id=existing_issue_id,
             body=comment_body,
             author_kind="external",
-            extra_metadata={"room": room["room_number"], "sender": sender_name},
+            extra_metadata={"room": room_no, "sender": sender_name},
         )
-        return {"issue_id": issue_id, "created": False}
+        await _admin_mirror(
+            f"📌 *Pipeline* — appended to existing thread `{existing_issue_id[:8]}` for Room {room_no}. "
+            f"Assignee continues; agent will respond on next heartbeat (~10–60 sec)."
+        )
+        return {"issue_id": existing_issue_id, "created": False}
 
+    # PIPELINE STAGE 1: classify intent
     intent, assignee, priority = await classifier.classify(text)
-    title = f"[Room {room['room_number']}] {sender_name}: {text[:60]}"
+    classifier_model = os.environ.get("CLASSIFIER_MODEL", "qwen3:8b-fast")
+    pri_label = f" *priority {priority}*" if priority else ""
+    await _admin_mirror(
+        f"🔍 *Pipeline 1/3* — Classifier ({classifier_model}) → intent: *{intent}*, "
+        f"route: *{assignee}*{pri_label}"
+    )
+
+    # PIPELINE STAGE 2: create the issue
+    title = f"[Room {room_no}] {sender_name}: {text[:60]}"
     body_parts = [
-        f"**Room:** {room['room_number']}",
+        f"**Room:** {room_no}",
         f"**Guest:** {sender_name}",
         f"**Channel:** telegram_guest",
         f"**Intent:** {intent}",
@@ -692,7 +716,7 @@ async def _route_guest_room_message(
         to=tg_user_id,
         priority=priority,
         extra_metadata={
-            "room": room["room_number"],
+            "room": room_no,
             "guest_name": sender_name,
             "intent": intent,
             "profile": profile,
@@ -701,6 +725,18 @@ async def _route_guest_room_message(
     issue_id = str(issue.get("id") or "")
     if issue_id:
         store.set_issue_id("telegram_guest", tg_user_id, issue_id)
+
+    # PIPELINE STAGE 3: issue posted to Paperclip board
+    company_id = os.environ.get("PAPERCLIP_COMPANY_ID", "")
+    paperclip_base = os.environ.get("PAPERCLIP_API_BASE", "").rstrip("/")
+    board_url = f"{paperclip_base}/companies/{company_id}/issues/{issue_id}" if (issue_id and paperclip_base) else ""
+    await _admin_mirror(
+        f"📋 *Pipeline 2/3* — Issue `{issue_id[:8]}` created in Paperclip → assigned to *{assignee}*.\n"
+        + (f"Board: {board_url}" if board_url else "")
+        + f"\n⚙️ *Pipeline 3/3* — Agent ({assignee}) starts on next heartbeat. "
+        f"Reply will follow to guest + this chat."
+    )
+
     return {"issue_id": issue_id, "created": True, "intent": intent, "assignee": assignee}
 
 
