@@ -450,7 +450,6 @@ async def _handle_telegram_update(update: dict) -> JSONResponse:
             await telegram.send(
                 to=parsed["to"],
                 text=reply,
-                reply_to_message_id=parsed["message_id"],
                 message_thread_id=parsed.get("message_thread_id"),
             )
         return JSONResponse({"ok": True, "handled": "command"})
@@ -480,9 +479,7 @@ async def _handle_telegram_update(update: dict) -> JSONResponse:
             )
         except Exception as exc:
             reply = f"⚠️ Couldn't file: {exc}"
-        await telegram.send(
-            to=parsed["to"], text=reply, reply_to_message_id=parsed["message_id"]
-        )
+        await telegram.send(to=parsed["to"], text=reply)
         return JSONResponse({"ok": True, "handled": "dm_report"})
 
     # Unknown sender in DM → guest flow (existing behavior)
