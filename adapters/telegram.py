@@ -64,19 +64,32 @@ async def send(
         payload["reply_to_message_id"] = reply_to_message_id
     if message_thread_id:
         payload["message_thread_id"] = message_thread_id
+
     async with httpx.AsyncClient(timeout=20.0) as client:
-        try:
-            r = await client.post(f"{TG_API}/sendMessage", json=payload)
-            r.raise_for_status()
+        r = await client.post(f"{TG_API}/sendMessage", json=payload)
+        if r.status_code == 200:
             return r.json()
-        except httpx.HTTPStatusError as exc:
-            # Fallback: retry without markdown if parse error
-            if exc.response.status_code == 400 and parse_mode:
-                payload["parse_mode"] = ""
-                r = await client.post(f"{TG_API}/sendMessage", json=payload)
-                r.raise_for_status()
-                return r.json()
-            raise
+
+        # Surface Telegram's error body
+        body = ""
+        try:
+            body = r.text
+        except Exception:
+            pass
+
+        # If markdown parse failure, retry plain text
+        if r.status_code == 400 and parse_mode and ("parse" in body.lower() or "entit" in body.lower() or "bytes" in body.lower()):
+            payload.pop("parse_mode", None)
+            r2 = await client.post(f"{TG_API}/sendMessage", json=payload)
+            if r2.status_code == 200:
+                return r2.json()
+            raise RuntimeError(
+                f"telegram sendMessage failed (after plaintext retry): {r2.status_code} {r2.text[:400]}"
+            )
+
+        raise RuntimeError(
+            f"telegram sendMessage failed: {r.status_code} {body[:400]}"
+        )
 
 
 async def get_me() -> dict[str, Any]:
