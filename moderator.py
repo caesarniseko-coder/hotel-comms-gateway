@@ -21,7 +21,12 @@ import httpx
 log = logging.getLogger("moderator")
 
 MODERATOR_MODEL = os.environ.get("MODERATOR_MODEL", "dolphin3:8b")
-MODERATOR_FALLBACK = os.environ.get("MODERATOR_FALLBACK_MODEL", "qwen3:8b-fast")
+MODERATOR_FALLBACK = os.environ.get("MODERATOR_FALLBACK_MODEL", "qwen3:8b")
+# Direct path to the L4 HF Space (private — needs HF token).
+# If MODERATOR_DIRECT_URL is set, we bypass the metered gateway and hit Ollama directly.
+DIRECT_URL = os.environ.get("MODERATOR_DIRECT_URL", "").rstrip("/")
+DIRECT_TOKEN = os.environ.get("MODERATOR_DIRECT_TOKEN", "") or os.environ.get("HF_TOKEN", "")
+# Optional metered-gateway fallback (the 109.207.77.181 path)
 GATEWAY_URL = os.environ.get("GATEWAY_BASE_URL", "").rstrip("/")
 GATEWAY_KEY = os.environ.get("GATEWAY_API_KEY_CLASSIFIER", "") or os.environ.get("GATEWAY_API_KEY", "")
 
@@ -87,6 +92,34 @@ Output ONLY a single JSON object (no preamble, no markdown):
 If ethical_flag is "decline", suggested_vendor_or_alternative MUST still be a legitimate alternative — never just refuse."""
 
 
+async def _call_direct(model: str, system: str, user: str) -> str | None:
+    """Hit Ollama directly on the L4 HF Space (no metered gateway hop)."""
+    if not DIRECT_URL or not DIRECT_TOKEN:
+        return None
+    body = {
+        "model": model,
+        "messages": [
+            {"role": "system", "content": system},
+            {"role": "user", "content": user},
+        ],
+        "stream": False,
+        "options": {"temperature": 0.4, "num_predict": 400},
+    }
+    try:
+        async with httpx.AsyncClient(timeout=45.0) as client:
+            r = await client.post(
+                f"{DIRECT_URL}/api/chat",
+                headers={"Authorization": f"Bearer {DIRECT_TOKEN}", "Content-Type": "application/json"},
+                json=body,
+            )
+            r.raise_for_status()
+            data = r.json()
+            return (data.get("message") or {}).get("content") or ""
+    except Exception as exc:
+        log.warning("direct moderator call (%s) failed: %s", model, exc)
+        return None
+
+
 async def _call_gateway(model: str, system: str, user: str) -> str | None:
     if not GATEWAY_URL or not GATEWAY_KEY:
         return None
@@ -115,6 +148,14 @@ async def _call_gateway(model: str, system: str, user: str) -> str | None:
         return None
 
 
+async def _call_model(model: str, system: str, user: str) -> str | None:
+    """Try direct path first, fall back to metered gateway."""
+    out = await _call_direct(model, system, user)
+    if out:
+        return out
+    return await _call_gateway(model, system, user)
+
+
 def _extract_json(text: str) -> dict | None:
     if not text:
         return None
@@ -138,9 +179,9 @@ async def assess(text: str, guest_name: str | None = None, room_no: str | None =
         f"\"{text.strip()}\".\nProduce the JSON plan."
     )
 
-    raw = await _call_gateway(MODERATOR_MODEL, _SYSTEM_PROMPT, user_msg)
+    raw = await _call_model(MODERATOR_MODEL, _SYSTEM_PROMPT, user_msg)
     if not raw:
-        raw = await _call_gateway(MODERATOR_FALLBACK, _SYSTEM_PROMPT, user_msg)
+        raw = await _call_model(MODERATOR_FALLBACK, _SYSTEM_PROMPT, user_msg)
     if not raw:
         return {
             "category": "other",
