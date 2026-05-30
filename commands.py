@@ -593,6 +593,24 @@ async def handle_events(tg_user_id: str, args: str) -> str:
     return "\n".join(lines)
 
 
+async def handle_search_web(tg_user_id: str, args: str) -> str:
+    if not staff.is_admin(tg_user_id):
+        return "🔒 Admin only."
+    if not args.strip():
+        return "Usage: `/search_web <query>` — e.g. `/search_web sushi near Promenade Square`"
+    import search as web
+    results = await web.search(args.strip(), n=5)
+    if not results:
+        return "No results."
+    lines = [f"*Web search* — `{args.strip()}` ({len(results)} hits)\n"]
+    for i, r in enumerate(results[:5], 1):
+        title = (r.get("title") or "").strip()[:80]
+        snippet = (r.get("snippet") or "").strip()[:200]
+        url = r.get("url") or ""
+        lines.append(f"{i}. *{title}*\n{snippet}\n{url}")
+    return "\n\n".join(lines)
+
+
 async def handle_threads(tg_user_id: str, args: str) -> str:
     if not staff.is_admin(tg_user_id):
         return "🔒 Admin only."
@@ -879,4 +897,6 @@ async def dispatch(*, text: str, msg_from: dict, chat: dict) -> Optional[str]:
         return await handle_search(tg_user_id, args)
     if cmd in ("threads", "topics"):
         return await handle_threads(tg_user_id, args)
+    if cmd in ("search_web", "searchweb", "web", "google"):
+        return await handle_search_web(tg_user_id, args)
     return None  # unknown command — caller decides whether to ignore

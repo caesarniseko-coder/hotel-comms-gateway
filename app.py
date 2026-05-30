@@ -29,6 +29,7 @@ import memory as guest_mem
 import paperclip_client as pc
 import poller
 import reply_validator
+import search as web_search
 import sentiment
 import staff
 import store
@@ -1019,6 +1020,32 @@ async def _route_guest_room_message(
     # PIPELINE STAGE 2: create the issue — natural prose body, no labels to mimic.
     title = f"[Room {room_no}] {sender_name}: {text[:60]}"
     profile_prose = _profile_prose()
+
+    # If the topic needs external info, fetch search snippets and embed them
+    search_block = ""
+    if intent in ("concierge",) and any(
+        kw in text.lower()
+        for kw in (
+            "where", "nearby", "near the hotel", "near", "recommend", "best",
+            "around", "directions", "how do i get", "what's on", "event",
+            "show", "theatre", "museum", "shop", "open", "hours", "closes",
+            "restaurant", "bar", "cafe", "coffee", "store",
+        )
+    ):
+        try:
+            results = await web_search.search(text, n=5)
+            if results:
+                search_block = (
+                    "\n\nWeb search snippets (use these for the reply, cite hours/places):\n"
+                    + web_search.format_snippets(results, limit=5)
+                    + "\n"
+                )
+                await _admin_mirror(
+                    f"🔎 Web search injected ({len(results)} hits): `{text[:60]}`"
+                )
+        except Exception as exc:
+            log.warning("web search failed: %s", exc)
+
     body = (
         f"A guest in Room {room_no}, name {sender_name}, contacted us via "
         f"Telegram. They wrote: \"{text}\".\n\n"
@@ -1026,6 +1053,7 @@ async def _route_guest_room_message(
         + (f" {tone_note}" if tone_note else "")
         + "\n\n"
         + (f"{profile_prose}\n\n" if profile_prose else "")
+        + search_block
         + "Reply directly to the guest now. "
         f"Use their EXACT name ({sender_name}) and EXACT room number ({room_no}) — "
         f"do NOT invent any other name or room number. Be brief (1–3 sentences), warm, "
