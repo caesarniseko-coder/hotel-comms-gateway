@@ -26,6 +26,7 @@ import guest_commands
 import guest_profile
 import paperclip_client as pc
 import poller
+import sentiment
 import staff
 import store
 import world
@@ -659,19 +660,25 @@ async def _handle_guest_update(update: dict) -> JSONResponse:
         )
         return JSONResponse({"ok": True, "handled": "checkin_prompt"})
 
-    # Send IMMEDIATE acknowledgement to guest so they know we received it
+    # Track follow-up count for this thread
+    fu_key = f"followup:tg:{tg_user_id}"
+    raw_fu = store.kv_get(fu_key)
+    follow_up_index = int(raw_fu) if (raw_fu and raw_fu.isdigit()) else 0
+
+    # Sentiment-aware immediate acknowledgement
+    sent = sentiment.score(text)
+    ack = sentiment.pick_ack(
+        text=text,
+        guest_name=room.get("guest_name") or "",
+        room_number=room["room_number"],
+        follow_up_index=follow_up_index,
+    )
     try:
-        await GUEST_BOT.send(
-            to=parsed["to"],
-            text=(
-                "Got it — our team is on this now. I'll be back to you within "
-                "a minute. 🛎"
-            ),
-        )
+        await GUEST_BOT.send(to=parsed["to"], text=ack)
     except Exception as exc:
         log.warning("guest ack failed: %s", exc)
 
-    # Mirror inbound to admin with profile snippet for context
+    # Mirror inbound to admin with profile snippet + sentiment tag
     profile_line = ""
     if room.get("profile_json"):
         try:
@@ -682,25 +689,92 @@ async def _handle_guest_update(update: dict) -> JSONResponse:
             )
         except Exception:
             pass
+    tone_emoji = {"calm": "💬", "urgent": "⚡", "frustrated": "😤", "angry": "🔥"}.get(sent["tone"], "💬")
+    fu_label = f" · follow-up #{follow_up_index + 1}" if follow_up_index > 0 else ""
     await _admin_mirror(
-        f"🛏 Room {room['room_number']} ({room.get('guest_name') or 'guest'}{profile_line}) →\n{text[:1200]}"
+        f"{tone_emoji} Room {room['room_number']} ({room.get('guest_name') or 'guest'}{profile_line}{fu_label}) →\n"
+        f"{text[:1200]}\n"
+        f"_(sentiment: {sent['tone']}, score {sent['score']})_"
     )
+
+    # Increment follow-up counter for next time
+    store.kv_set(fu_key, str(follow_up_index + 1))
 
     # Route to Paperclip (Guest Conversations project), classify + assign
     result = await _route_guest_room_message(
         room=room,
         msg_from=msg_from,
         text=text,
+        sentiment_info=sent,
+        follow_up_index=follow_up_index,
     )
 
-    # Wake the assigned agent immediately so we don't wait 5+ min for heartbeat
-    assignee = result.get("assignee")
+    # Wake the assigned agent immediately (every message, not just first)
+    assignee = result.get("assignee") or result.get("assigned_agent")
     if assignee:
         try:
             await pc.wake_agent(assignee, reason="guest_message")
-            await _admin_mirror(f"⚡ {assignee} woken on demand (no waiting for heartbeat).")
+            await _admin_mirror(f"⚡ {assignee} woken on demand.")
         except Exception as exc:
             log.warning("wake_agent(%s) failed: %s", assignee, exc)
+
+    # Auto-escalate to GM if sentiment / repetition warrants it
+    if sentiment.should_escalate_to_gm(sentiment=sent, follow_up_index=follow_up_index):
+        try:
+            esc = await pc.create_issue(
+                project_id=STAFF_PROJECT_ID,
+                title=f"[ESCALATION] Room {room['room_number']} — {sent['tone']} guest, {follow_up_index + 1} msgs",
+                body=(
+                    f"Auto-escalated by sentiment heuristic.\n\n"
+                    f"Guest: {room.get('guest_name')} in Room {room['room_number']} "
+                    f"({(json.loads(room['profile_json']) if room.get('profile_json') else {}).get('loyalty_tier', '?')} tier).\n"
+                    f"Tone: {sent['tone']} (score {sent['score']}, signals: {', '.join(sent['signals'])}).\n"
+                    f"Follow-ups so far: {follow_up_index + 1}.\n\n"
+                    f"Latest message: \"{text[:300]}\"\n\n"
+                    f"Action: take over personally, contact guest within 60 sec, propose recovery."
+                ),
+                assignee_slug="GM",
+                channel="telegram_staff",
+                to=str(staff.admin_user_id() or "0"),
+                priority="high",
+                extra_metadata={
+                    "escalation_for": result.get("issue_id"),
+                    "room": room["room_number"],
+                    "guest_name": room.get("guest_name"),
+                    "tone": sent["tone"],
+                },
+            )
+            esc_id = str(esc.get("id") or "")
+            if esc_id:
+                store.set_issue_origin(
+                    issue_id=esc_id,
+                    origin_kind="autonomy",
+                    tg_chat_id=None,
+                    tg_user_id=staff.admin_user_id(),
+                    department=staff.DEPT_MANAGEMENT,
+                )
+                store.log_event(
+                    event_type="escalation",
+                    issue_id=esc_id,
+                    parent_issue=result.get("issue_id"),
+                    actor="system",
+                    actor_kind="system",
+                    department=staff.DEPT_MANAGEMENT,
+                    priority="high",
+                    room_number=room["room_number"],
+                    payload={"tone": sent["tone"], "follow_ups": follow_up_index + 1},
+                )
+            try:
+                await pc.wake_agent("GM", reason="auto_escalation")
+            except Exception:
+                pass
+            await _admin_mirror(
+                f"🚨 *ESCALATION* — GM auto-engaged for Room {room['room_number']} "
+                f"(tone: {sent['tone']}, msg #{follow_up_index + 1}). "
+                f"Issue `{esc_id[:8]}` created with priority *high*."
+            )
+        except Exception as exc:
+            log.warning("auto-escalation failed: %s", exc)
 
     return JSONResponse({"ok": True, "handled": "guest_message", **result})
 
@@ -710,9 +784,14 @@ async def _route_guest_room_message(
     room: dict,
     msg_from: dict,
     text: str,
+    sentiment_info: dict | None = None,
+    follow_up_index: int = 0,
 ) -> dict[str, Any]:
     """Create/append a Paperclip issue for a guest message, assigned by intent.
     Emits pipeline trace events to the admin mirror so the admin sees the whole flow.
+
+    Issue body is written as natural prose (no labelled fields) to eliminate the
+    model's tendency to echo labels in its reply.
     """
     tg_user_id = str(msg_from.get("id"))
     sender_name = room.get("guest_name") or (
@@ -727,23 +806,71 @@ async def _route_guest_room_message(
             profile = json.loads(room["profile_json"])
         except Exception:
             profile = None
-    profile_block = guest_profile.format_context(profile) if profile else ""
+
+    def _profile_prose() -> str:
+        if not profile:
+            return ""
+        loyalty = profile.get("loyalty_tier") or "—"
+        prefs = profile.get("preferences") or []
+        prefs_part = (
+            f" Their stated preferences: {', '.join(prefs)}." if prefs else ""
+        )
+        return (
+            f"Profile: {loyalty}-tier guest, "
+            f"{profile.get('segment','—')} traveller, "
+            f"{profile.get('prior_stays','0')} prior stays. "
+            f"Booking {profile.get('booking_ref','—')} "
+            f"({profile.get('nights','?')} nights, check-out "
+            f"{profile.get('departure','—')}, ${profile.get('rate_per_night_usd','?')}/night, "
+            f"{profile.get('payment_status','—')})."
+            f"{prefs_part}"
+        )
+
+    tone_note = ""
+    if sentiment_info and sentiment_info.get("tone") in ("urgent", "frustrated", "angry"):
+        tone_note = (
+            f" The guest seems {sentiment_info['tone']} "
+            f"(signals: {', '.join(sentiment_info.get('signals', []))}). "
+            f"Respond with extra care and a concrete ETA."
+        )
+    if follow_up_index > 0:
+        tone_note += (
+            f" This is follow-up message #{follow_up_index + 1} in the thread — "
+            f"the guest has been waiting and is checking again."
+        )
 
     # Thread continuity: same guest → same issue
     existing_issue_id = store.get_issue_id("telegram_guest", tg_user_id)
     if existing_issue_id:
-        comment_body = f"**{sender_name}** (Room {room_no}):\n\n{text}"
-        if profile_block:
-            comment_body += f"\n\n_Guest context_: {profile_block}"
+        comment_body = (
+            f"{sender_name} (the guest in Room {room_no}) sent another message: "
+            f"\"{text}\"."
+            + (f" {tone_note}" if tone_note else "")
+            + "\n\nReply directly to the guest. "
+            f"Use their actual name ({sender_name}) and their actual room number ({room_no}) — "
+            f"do NOT invent any other name or room. Be brief, warm, and specific."
+        )
         await pc.add_comment(
             issue_id=existing_issue_id,
             body=comment_body,
             author_kind="external",
-            extra_metadata={"room": room_no, "sender": sender_name},
+            extra_metadata={"room": room_no, "sender": sender_name, "agent_name": None},
         )
+        # Wake the currently-assigned agent so the follow-up gets immediate attention
+        try:
+            issue_full = await pc.get_issue(existing_issue_id)
+            aid = issue_full.get("assigneeAgentId")
+            if aid:
+                name_map = await pc._agents_by_name()
+                for n, idv in name_map.items():
+                    if idv == aid:
+                        await pc.wake_agent(n, reason="guest_follow_up")
+                        break
+        except Exception as exc:
+            log.warning("wake on follow-up failed: %s", exc)
         await _admin_mirror(
-            f"📌 *Pipeline* — appended to existing thread `{existing_issue_id[:8]}` for Room {room_no}. "
-            f"Assignee continues; agent will respond on next heartbeat (~10–60 sec)."
+            f"📌 *Pipeline* — appended to thread `{existing_issue_id[:8]}` for Room {room_no}. "
+            f"Assignee woken; reply incoming in ~10–30 sec."
         )
         return {"issue_id": existing_issue_id, "created": False}
 
@@ -774,17 +901,24 @@ async def _route_guest_room_message(
         f"route: *{assignee}*{pri_label}"
     )
 
-    # PIPELINE STAGE 2: create the issue
+    # PIPELINE STAGE 2: create the issue — natural prose body, no labels to mimic.
     title = f"[Room {room_no}] {sender_name}: {text[:60]}"
-    body_parts = [
-        f"**Room:** {room_no}",
-        f"**Guest:** {sender_name}",
-        f"**Channel:** telegram_guest",
-        f"**Intent:** {intent}",
-    ]
-    if profile_block:
-        body_parts.append(f"**Guest profile:** {profile_block}")
-    body = "\n".join(body_parts) + f"\n\n---\n\n{text}"
+    profile_prose = _profile_prose()
+    body = (
+        f"A guest in Room {room_no}, name {sender_name}, contacted us via "
+        f"Telegram. They wrote: \"{text}\".\n\n"
+        f"This message is routed under the {intent} intent."
+        + (f" {tone_note}" if tone_note else "")
+        + "\n\n"
+        + (f"{profile_prose}\n\n" if profile_prose else "")
+        + "Reply directly to the guest now. "
+        f"Use their EXACT name ({sender_name}) and EXACT room number ({room_no}) — "
+        f"do NOT invent any other name or room number. Be brief (1–3 sentences), warm, "
+        f"specific, with a concrete ETA. If this isn't your domain, write "
+        f"@HANDOFF: <Department> on its own line, after a brief acknowledgement to "
+        f"the guest with an ETA. Always end with STATUS: in_review on its own line "
+        f"(the system strips it before showing to the guest)."
+    )
 
     issue = await pc.create_issue(
         project_id=GUEST_PROJECT_ID,
