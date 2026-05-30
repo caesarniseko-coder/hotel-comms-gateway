@@ -158,6 +158,36 @@ async def debug_errors() -> dict[str, Any]:
     return {"errors": list(_last_errors), "bot": _bot_username}
 
 
+@app.get("/debug/net")
+async def debug_net() -> dict[str, Any]:
+    """Probe outbound network from the Space."""
+    import socket
+    import httpx
+    targets = [
+        "api.telegram.org",
+        "huggingface.co",
+        "caesarniseko-paperclip.hf.space",
+        "google.com",
+        "1.1.1.1",
+    ]
+    out: dict[str, Any] = {}
+    for host in targets:
+        info: dict[str, Any] = {}
+        try:
+            ips = list({a[4][0] for a in socket.getaddrinfo(host, 443)})
+            info["dns"] = ips
+        except Exception as exc:
+            info["dns_error"] = f"{type(exc).__name__}: {exc}"
+        try:
+            async with httpx.AsyncClient(timeout=10.0) as client:
+                r = await client.get(f"https://{host}/")
+                info["http_status"] = r.status_code
+        except Exception as exc:
+            info["http_error"] = f"{type(exc).__name__}: {exc}"
+        out[host] = info
+    return out
+
+
 @app.get("/debug/updates")
 async def debug_updates() -> dict[str, Any]:
     return {"updates": list(_last_updates)}
