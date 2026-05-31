@@ -138,6 +138,14 @@ async def handle_room(tg_user_id: str) -> str:
     )
 
 
+_ADMIN_COMMANDS = {
+    "sim_start", "sim_stop", "sim_status", "start_day", "stop_day", "world",
+    "seed_day", "analytics", "stats", "metrics", "events", "threads", "rooms",
+    "room_history", "search_web", "moderate", "guest", "dept", "register",
+    "checkin_admin", "iam", "tasks", "take", "done", "handoff", "ask", "status",
+}
+
+
 async def dispatch(*, text: str, msg_from: dict, chat: dict) -> Optional[str]:
     cmd, args = _split_command(text)
     tg_user_id = str(msg_from.get("id"))
@@ -151,4 +159,9 @@ async def dispatch(*, text: str, msg_from: dict, chat: dict) -> Optional[str]:
         return await handle_checkout(tg_user_id)
     if cmd == "room":
         return await handle_room(tg_user_id)
+    if cmd in _ADMIN_COMMANDS:
+        return (
+            f"ℹ️ `/{cmd}` is a staff command. Send it in the STAFF bot "
+            f"(@kutchan_hotel_concierge_bot), not here."
+        )
     return None
