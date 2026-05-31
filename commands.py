@@ -434,17 +434,19 @@ async def handle_start_day(tg_user_id: str, args: str) -> str:
     import asyncio as _asyncio
     if not staff.is_admin(tg_user_id):
         return "🔒 Admin only."
-    if world.is_running():
+    import guest_sim as gs
+    if world.is_running() and gs.is_running():
         s = world.get_state()
+        gst = gs.get_state()
         return (
             f"☀️ The day is already running.\n"
             f"World clock: {s['world_hour']:02d}:{s['world_minute']:02d}, "
             f"occupancy {int(s['occupancy']*100)}%, ADR ${s['adr']:.0f}.\n"
+            f"Active sim guests: {gst.get('active_guests',0)}.\n"
             f"/stop_day to halt or /world to inspect."
         )
 
-    # Fire-and-forget: start the driver and seed in background so the webhook
-    # response lands within Telegram's timeout.
+    # Fire-and-forget: world + sim + seeds in the background
     async def _bg():
         try:
             await autonomy.seed_day(force=False)
@@ -453,29 +455,44 @@ async def handle_start_day(tg_user_id: str, args: str) -> str:
         try:
             await world.start_day()
         except Exception:
-            log.exception("world.start_day in background failed")
+            log.exception("world.start_day failed")
+        try:
+            from app import _sim_handler
+            await gs.start_sim(_sim_handler)
+        except Exception:
+            log.exception("guest_sim.start_sim failed")
 
     _asyncio.create_task(_bg())
     return (
-        "🌅 Operating day STARTING…\n"
-        "Seeding standing tasks + starting the world driver in the background. "
-        "Synthetic events will begin firing in ~30 sec. Agent pulses will cascade "
-        "into this chat over the next 5–15 minutes.\n\n"
-        "/world to inspect current state.\n"
-        "/stop_day to halt."
+        "🌅 *Operating day STARTING…*\n\n"
+        "Booting in parallel:\n"
+        "  • World driver — synthetic events (VIP arrivals, complaints, WO, etc.)\n"
+        "  • Standing daily tasks — one per HOD\n"
+        "  • *Guest simulator* — synthetic guests check in + send messages\n\n"
+        "Expect first activity in ~30 sec. Watch:\n"
+        "  — *this chat* (staff bot) for the operations control room\n"
+        "  — *guest bot DM* for the [SIM] guest-conversation theatre\n\n"
+        "/world  ·  /sim_status  ·  /threads  ·  /analytics  ·  /stop_day"
     )
 
 
 async def handle_stop_day(tg_user_id: str, args: str) -> str:
     if not staff.is_admin(tg_user_id):
         return "🔒 Admin only."
+    import guest_sim as gs
     result = await world.stop_day()
-    if result.get("already_stopped"):
+    sim_result = await gs.stop_sim()
+    n_checked_out = 0
+    if not sim_result.get("already_stopped"):
+        n_checked_out = await gs.checkout_all_sim()
+    if result.get("already_stopped") and sim_result.get("already_stopped"):
         return "🌙 The day is already stopped."
     return (
-        "🌙 *Operating day STOPPED*\n"
-        "World driver halted. Heartbeats remain enabled but no new events will "
-        "be injected. Restart with /start_day."
+        f"🌙 *Operating day STOPPED*\n"
+        f"  • World driver halted.\n"
+        f"  • Guest simulator halted (force-checked-out {n_checked_out} synthetic guests).\n"
+        f"  • Agent heartbeats remain enabled (won't drop new events).\n"
+        f"Restart with /start_day."
     )
 
 
