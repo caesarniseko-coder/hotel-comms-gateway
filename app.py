@@ -469,6 +469,31 @@ async def debug_state() -> dict[str, Any]:
     }
 
 
+@app.post("/debug/sim_burst")
+async def debug_sim_burst() -> dict[str, Any]:
+    """Force-trigger a single sim tick and capture full state of what happens."""
+    import traceback
+    result: dict[str, Any] = {"before": {}, "after": {}, "errors": []}
+    try:
+        result["before"] = {
+            "running": guest_sim.is_running(),
+            "active_rooms": [r["room_number"] for r in guest_sim._active_sim_rooms()],
+        }
+        actions = await guest_sim.tick(_sim_handler)
+        result["actions"] = actions
+        result["after"] = {
+            "running": guest_sim.is_running(),
+            "active_rooms": [r["room_number"] for r in guest_sim._active_sim_rooms()],
+        }
+    except Exception as exc:
+        result["errors"].append({
+            "stage": "sim_burst",
+            "error": f"{type(exc).__name__}: {exc}",
+            "tb": traceback.format_exc().splitlines()[-8:],
+        })
+    return result
+
+
 @app.post("/debug/start_all")
 async def debug_start_all() -> dict[str, Any]:
     """Force-start world + sim from HTTP (bypass Telegram). Returns detailed step results."""

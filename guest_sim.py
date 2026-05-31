@@ -268,7 +268,12 @@ async def _send_message(handler_fn, room: dict) -> None:
             intent_hint=intent,
         )
     except Exception as exc:
-        log.warning("sim message handler failed: %s", exc)
+        log.exception("sim message handler failed: %s", exc)
+        try:
+            from app import _record_error
+            _record_error("sim_send_message", exc)
+        except Exception:
+            pass
 
 
 async def _check_out_one(handler_fn, room: dict) -> None:
