@@ -137,6 +137,43 @@ async def _dispatch_to_channel(channel: str, to: str, body: str) -> None:
         expected_room = room.get("room_number") or ""
         expected_name = room.get("guest_name") or ""
 
+        # Synthetic guest? Redirect to admin's guest-bot DM, theatrically tagged
+        is_sim = str(to).startswith("sim:")
+        if is_sim:
+            admin_id = staff.admin_user_id()
+            if admin_id:
+                sim_label = f"🎭 [SIM Room {expected_room}] Concierge → {expected_name}:"
+                # Stripped for guest output already; also run reply_validator for clean text
+                corrected, report = reply_validator.correct_reply(
+                    reply=clean,
+                    expected_name=expected_name,
+                    expected_room=expected_room,
+                )
+                try:
+                    await GUEST_BOT.send(to=str(admin_id), text=f"{sim_label}\n{corrected}")
+                except Exception as exc:
+                    log.warning("sim guest-bot mirror failed: %s", exc)
+                # Admin staff-bot mirror with tagged agent name
+                agent_label = "Agent"
+                try:
+                    issue_id = store.get_issue_id("telegram_guest", to)
+                    if issue_id:
+                        issue = await pc.get_issue(issue_id)
+                        aid = issue.get("assigneeAgentId")
+                        if aid:
+                            name_map = await pc._agents_by_name()
+                            for n, idv in name_map.items():
+                                if idv == aid:
+                                    agent_label = n
+                                    break
+                except Exception:
+                    pass
+                await _admin_mirror(
+                    f"🤖 [SIM] Room {expected_room} ({expected_name}) ← {agent_label}:\n{corrected[:1200]}"
+                    + (f"\n_(🛠 {', '.join(report['changes'])})_" if report.get("changes") else "")
+                )
+            return
+
         # Pull the topic from the most recent issue meta
         expected_topic = None
         try:
@@ -916,12 +953,27 @@ async def _sim_handler(
     """Callback for guest_sim — routes synthetic events through the full pipeline."""
     if event == "checkin":
         if profile:
-            await _admin_mirror(
-                "🤖 [SIM] " + guest_profile.format_card(profile)
-            )
+            card = guest_profile.format_card(profile)
+            await _admin_mirror("🤖 [SIM] " + card)
+            # Theatrical check-in line in the guest bot
+            admin_id = staff.admin_user_id()
+            if admin_id:
+                try:
+                    await GUEST_BOT.send(
+                        to=str(admin_id),
+                        text=f"🎭 [SIM Room {room_no}] {(persona or {}).get('first_name')} just checked in.",
+                    )
+                except Exception:
+                    pass
         return
     if event == "checkout":
         await _admin_mirror(f"🤖 [SIM] Room {room_no} checked out.")
+        admin_id = staff.admin_user_id()
+        if admin_id:
+            try:
+                await GUEST_BOT.send(to=str(admin_id), text=f"🎭 [SIM Room {room_no}] checked out.")
+            except Exception:
+                pass
         return
     if event != "message" or not text:
         return
@@ -957,6 +1009,16 @@ async def _sim_handler(
         f"{text}\n"
         f"_(sentiment: {sent['tone']}, score {sent['score']}; intent_hint: {intent_hint})_"
     )
+
+    # Also surface in admin's guest-bot DM so they can watch the conversation
+    admin_id = staff.admin_user_id()
+    if admin_id:
+        guest_name = room.get("guest_name") or "guest"
+        sim_label = f"🎭 [SIM Room {room_no}] {guest_name}:"
+        try:
+            await GUEST_BOT.send(to=str(admin_id), text=f"{sim_label}\n{text}")
+        except Exception as exc:
+            log.warning("sim guest-bot inbound mirror failed: %s", exc)
 
     store.kv_set(fu_key, str(follow_up_index + 1))
 
