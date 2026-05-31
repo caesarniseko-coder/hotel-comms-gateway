@@ -452,6 +452,13 @@ async def _startup() -> None:
                 await autonomy.seed_day(force=False)
             except Exception as exc:
                 log.warning("auto seed_day failed: %s", exc)
+            # Initial burst so user sees activity within ~15 sec of boot
+            await asyncio.sleep(3)
+            try:
+                await guest_sim.force_burst(_sim_handler, n_guests=2, msgs_per_guest=1)
+                log.info("initial burst fired")
+            except Exception as exc:
+                log.warning("initial burst failed: %s", exc)
         asyncio.create_task(_auto_kick())
 
 

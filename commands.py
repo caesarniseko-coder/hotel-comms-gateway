@@ -436,14 +436,22 @@ async def handle_start_day(tg_user_id: str, args: str) -> str:
         return "🔒 Admin only."
     import guest_sim as gs
     if world.is_running() and gs.is_running():
+        # Already running — fire a burst so the user sees instant activity
+        from app import _sim_handler
+        async def _burst_bg():
+            try:
+                await gs.force_burst(_sim_handler, n_guests=3, msgs_per_guest=1)
+            except Exception:
+                log.exception("force_burst failed")
+        _asyncio.create_task(_burst_bg())
         s = world.get_state()
         gst = gs.get_state()
         return (
-            f"☀️ The day is already running.\n"
+            f"☀️ The day is already running — firing a *burst* (3 check-ins + msgs) now.\n"
             f"World clock: {s['world_hour']:02d}:{s['world_minute']:02d}, "
             f"occupancy {int(s['occupancy']*100)}%, ADR ${s['adr']:.0f}.\n"
-            f"Active sim guests: {gst.get('active_guests',0)}.\n"
-            f"/stop_day to halt or /world to inspect."
+            f"Active sim guests before: {gst.get('active_guests',0)}.\n"
+            f"Watch both bots for the next 30 sec."
         )
 
     # Each subsystem starts independently so a slow one doesn't block the others.
@@ -473,6 +481,16 @@ async def handle_start_day(tg_user_id: str, args: str) -> str:
     _asyncio.create_task(_start_world())
     _asyncio.create_task(_start_sim())
     _asyncio.create_task(_start_seeds())
+
+    # Immediate burst so user sees activity within ~15 sec
+    async def _initial_burst():
+        await _asyncio.sleep(3)  # let world + sim init
+        try:
+            from app import _sim_handler
+            await gs.force_burst(_sim_handler, n_guests=3, msgs_per_guest=1)
+        except Exception:
+            log.exception("initial burst failed")
+    _asyncio.create_task(_initial_burst())
 
     # Dead code below — _bg used to be defined here. Kept return below intact.
     async def _bg():
@@ -656,6 +674,24 @@ async def handle_sim_stop(tg_user_id: str, args: str) -> str:
         return "🤖 Sim already stopped."
     n = await gs.checkout_all_sim()
     return f"🤖 Guest simulator STOPPED. Force-checked-out {n} synthetic guests."
+
+
+async def handle_sim_burst(tg_user_id: str, args: str) -> str:
+    if not staff.is_admin(tg_user_id):
+        return "🔒 Admin only."
+    import guest_sim as gs
+    from app import _sim_handler
+    n = 3
+    if args.strip().isdigit():
+        n = max(1, min(int(args.strip()), 8))
+    import asyncio as _asyncio
+    async def _bg():
+        try:
+            await gs.force_burst(_sim_handler, n_guests=n, msgs_per_guest=1)
+        except Exception:
+            log.exception("burst failed")
+    _asyncio.create_task(_bg())
+    return f"💥 Firing burst — {n} new sim check-ins + messages now."
 
 
 async def handle_sim_status(tg_user_id: str) -> str:
@@ -1008,4 +1044,6 @@ async def dispatch(*, text: str, msg_from: dict, chat: dict) -> Optional[str]:
         return await handle_sim_stop(tg_user_id, args)
     if cmd in ("sim_status", "simstatus", "sim"):
         return await handle_sim_status(tg_user_id)
+    if cmd in ("sim_burst", "simburst", "burst"):
+        return await handle_sim_burst(tg_user_id, args)
     return None  # unknown command — caller decides whether to ignore

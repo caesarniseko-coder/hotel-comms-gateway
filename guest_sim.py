@@ -365,6 +365,21 @@ async def start_sim(handler_fn) -> dict:
     return {"ok": True, "started": True, "tick_seconds": SIM_TICK_SECONDS}
 
 
+async def force_burst(handler_fn, n_guests: int = 3, msgs_per_guest: int = 2) -> dict:
+    """Force-check-in N guests immediately + send M messages each. For instant demo."""
+    res = {"checkins": 0, "messages": 0}
+    for _ in range(n_guests):
+        rec = await _check_in_one(handler_fn)
+        if rec:
+            res["checkins"] += 1
+    # Send messages for all active guests
+    actives = _active_sim_rooms()
+    for room_rec in actives[:n_guests * msgs_per_guest]:
+        await _send_message(handler_fn, room_rec)
+        res["messages"] += 1
+    return res
+
+
 async def stop_sim() -> dict:
     global _TASK
     state = _load_state()
