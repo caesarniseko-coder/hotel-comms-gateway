@@ -458,6 +458,17 @@ async def debug_errors() -> dict[str, Any]:
     return {"errors": list(_last_errors), "bot": _bot_username}
 
 
+@app.get("/debug/state")
+async def debug_state() -> dict[str, Any]:
+    return {
+        "world": world.get_state(),
+        "guest_sim": guest_sim.get_state(),
+        "active_sim_rooms": [r["room_number"] for r in guest_sim._active_sim_rooms()],
+        "open_topic_threads": len(store.list_open_topic_threads()),
+        "active_rooms": len(store.list_active_rooms()),
+    }
+
+
 @app.get("/debug/net")
 async def debug_net() -> dict[str, Any]:
     """Probe outbound network from the Space."""
