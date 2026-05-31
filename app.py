@@ -469,6 +469,37 @@ async def debug_state() -> dict[str, Any]:
     }
 
 
+@app.post("/debug/start_all")
+async def debug_start_all() -> dict[str, Any]:
+    """Force-start world + sim from HTTP (bypass Telegram). Returns detailed step results."""
+    import traceback
+    results: dict[str, Any] = {}
+    try:
+        import autonomy
+        seed_res = await autonomy.seed_day(force=False)
+        results["seed"] = seed_res
+    except Exception as exc:
+        results["seed_error"] = f"{type(exc).__name__}: {exc}"
+        results["seed_tb"] = traceback.format_exc().splitlines()[-6:]
+    try:
+        wr = await world.start_day()
+        results["world"] = wr
+    except Exception as exc:
+        results["world_error"] = f"{type(exc).__name__}: {exc}"
+        results["world_tb"] = traceback.format_exc().splitlines()[-6:]
+    try:
+        sr = await guest_sim.start_sim(_sim_handler)
+        results["sim"] = sr
+    except Exception as exc:
+        results["sim_error"] = f"{type(exc).__name__}: {exc}"
+        results["sim_tb"] = traceback.format_exc().splitlines()[-6:]
+    results["state_after"] = {
+        "world_running": world.is_running(),
+        "sim_running": guest_sim.is_running(),
+    }
+    return results
+
+
 @app.get("/debug/net")
 async def debug_net() -> dict[str, Any]:
     """Probe outbound network from the Space."""
