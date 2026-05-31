@@ -499,6 +499,21 @@ async def debug_state() -> dict[str, Any]:
     }
 
 
+@app.post("/debug/force_burst")
+async def debug_force_burst(n: int = 3) -> dict[str, Any]:
+    """Unconditionally check in N sim guests + send a message each. Returns immediately
+    after dispatch and runs in background since each takes a few seconds."""
+    import asyncio as _aio
+    n = max(1, min(int(n), 8))
+    async def _bg():
+        try:
+            await guest_sim.force_burst(_sim_handler, n_guests=n, msgs_per_guest=1)
+        except Exception as exc:
+            _record_error("debug_force_burst", exc)
+    _aio.create_task(_bg())
+    return {"ok": True, "fired": n, "note": "running in background; check /debug/state in ~30 sec"}
+
+
 @app.post("/debug/sim_burst")
 async def debug_sim_burst() -> dict[str, Any]:
     """Force-trigger a single sim tick and capture full state of what happens."""
