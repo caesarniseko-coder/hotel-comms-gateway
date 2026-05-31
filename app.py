@@ -431,6 +431,29 @@ async def _startup() -> None:
     except Exception as exc:
         log.warning("guest_sim auto-resume failed: %s", exc)
 
+    # Auto-start everything (always-on simulation) unless explicitly disabled
+    if os.environ.get("AUTO_START_DAY", "1") == "1":
+        async def _auto_kick():
+            await asyncio.sleep(8)  # let server settle
+            try:
+                if not world.is_running():
+                    await world.start_day()
+                    log.info("auto-started world driver on boot")
+            except Exception as exc:
+                log.warning("auto world.start failed: %s", exc)
+            try:
+                if not guest_sim.is_running():
+                    await guest_sim.start_sim(_sim_handler)
+                    log.info("auto-started guest sim on boot")
+            except Exception as exc:
+                log.warning("auto guest_sim.start failed: %s", exc)
+            try:
+                import autonomy
+                await autonomy.seed_day(force=False)
+            except Exception as exc:
+                log.warning("auto seed_day failed: %s", exc)
+        asyncio.create_task(_auto_kick())
+
 
 @app.on_event("shutdown")
 async def _shutdown() -> None:
