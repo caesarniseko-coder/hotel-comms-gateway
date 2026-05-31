@@ -24,6 +24,7 @@ import classifier
 import commands
 import guest_commands
 import guest_profile
+import guest_sim
 import intent_split
 import memory as guest_mem
 import moderator
@@ -385,6 +386,13 @@ async def _startup() -> None:
         log.info("watchdog loop launched")
     except Exception as exc:
         log.warning("watchdog launch failed: %s", exc)
+    # Auto-resume guest simulator if it was running
+    try:
+        if guest_sim.is_running():
+            await guest_sim.start_sim(_sim_handler)
+            log.info("guest_sim auto-resumed")
+    except Exception as exc:
+        log.warning("guest_sim auto-resume failed: %s", exc)
 
 
 @app.on_event("shutdown")
@@ -893,6 +901,97 @@ async def _handle_guest_update(update: dict) -> JSONResponse:
             log.warning("auto-escalation failed: %s", exc)
 
     return JSONResponse({"ok": True, "handled": "guest_message", **result})
+
+
+async def _sim_handler(
+    *,
+    event: str,
+    persona: dict | None,
+    tg_id: str,
+    room_no: str,
+    profile: dict | None = None,
+    text: str | None = None,
+    intent_hint: str | None = None,
+) -> None:
+    """Callback for guest_sim — routes synthetic events through the full pipeline."""
+    if event == "checkin":
+        if profile:
+            await _admin_mirror(
+                "🤖 [SIM] " + guest_profile.format_card(profile)
+            )
+        return
+    if event == "checkout":
+        await _admin_mirror(f"🤖 [SIM] Room {room_no} checked out.")
+        return
+    if event != "message" or not text:
+        return
+
+    # Synthesize msg_from + run the SAME pipeline as a real Telegram guest
+    msg_from = {
+        "id": tg_id,
+        "first_name": (persona or {}).get("first_name") or "Guest",
+        "username": None,
+    }
+    room = store.get_room_for_guest(tg_id) or {}
+    if not room.get("room_number"):
+        return
+
+    # Sentiment + follow-up counter (independent per simulated guest)
+    fu_key = f"followup:sim:{tg_id}"
+    raw_fu = store.kv_get(fu_key)
+    follow_up_index = int(raw_fu) if (raw_fu and raw_fu.isdigit()) else 0
+    sent = sentiment.score(text)
+
+    # Mirror to admin with [SIM] tag
+    profile_line = ""
+    if room.get("profile_json"):
+        try:
+            p = json.loads(room["profile_json"])
+            profile_line = f" — {p.get('loyalty_tier')} tier, {p.get('segment')}"
+        except Exception:
+            pass
+    tone_emoji = {"calm": "💬", "urgent": "⚡", "frustrated": "😤", "angry": "🔥"}.get(sent["tone"], "💬")
+    fu_label = f" · follow-up #{follow_up_index + 1}" if follow_up_index > 0 else ""
+    await _admin_mirror(
+        f"🤖 [SIM] {tone_emoji} Room {room_no} ({room.get('guest_name') or 'guest'}{profile_line}{fu_label}) →\n"
+        f"{text}\n"
+        f"_(sentiment: {sent['tone']}, score {sent['score']}; intent_hint: {intent_hint})_"
+    )
+
+    store.kv_set(fu_key, str(follow_up_index + 1))
+
+    # Compound-intent split
+    clauses = intent_split.split_message(text)
+    if len(clauses) >= 2:
+        await _admin_mirror(
+            f"🤖 [SIM] 🪓 Multi-topic — splitting into {len(clauses)}: "
+            + ", ".join(t for t, _ in clauses)
+        )
+        assignees: list[str] = []
+        for _intent, clause_text in clauses:
+            r = await _route_guest_room_message(
+                room=room, msg_from=msg_from, text=clause_text,
+                sentiment_info=sent, follow_up_index=follow_up_index,
+            )
+            if r.get("assignee"):
+                assignees.append(r["assignee"])
+        for a in set(assignees):
+            try:
+                await pc.wake_agent(a, reason="sim_guest_message")
+            except Exception:
+                pass
+        return
+
+    # Single-topic path
+    result = await _route_guest_room_message(
+        room=room, msg_from=msg_from, text=text,
+        sentiment_info=sent, follow_up_index=follow_up_index,
+    )
+    if result.get("assignee"):
+        try:
+            await pc.wake_agent(result["assignee"], reason="sim_guest_message")
+        except Exception:
+            pass
 
 
 async def _route_guest_room_message(

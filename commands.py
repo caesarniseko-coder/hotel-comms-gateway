@@ -593,6 +593,54 @@ async def handle_events(tg_user_id: str, args: str) -> str:
     return "\n".join(lines)
 
 
+async def handle_sim_start(tg_user_id: str, args: str) -> str:
+    if not staff.is_admin(tg_user_id):
+        return "🔒 Admin only."
+    # Imported lazily to avoid cycles
+    from app import _sim_handler
+    import guest_sim as gs
+    r = await gs.start_sim(_sim_handler)
+    if r.get("already_running"):
+        s = gs.get_state()
+        return (
+            f"🤖 Sim already running.\n"
+            f"Active synthetic guests: {s.get('active_guests',0)}\n"
+            f"Ticks: {s.get('ticks',0)}"
+        )
+    return (
+        f"🤖 *Guest simulator STARTED* — synthetic guests will check in, "
+        f"send messages, and check out automatically. Tick every "
+        f"{r.get('tick_seconds')}s. You'll see [SIM]-tagged activity here."
+    )
+
+
+async def handle_sim_stop(tg_user_id: str, args: str) -> str:
+    if not staff.is_admin(tg_user_id):
+        return "🔒 Admin only."
+    import guest_sim as gs
+    r = await gs.stop_sim()
+    if r.get("already_stopped"):
+        return "🤖 Sim already stopped."
+    n = await gs.checkout_all_sim()
+    return f"🤖 Guest simulator STOPPED. Force-checked-out {n} synthetic guests."
+
+
+async def handle_sim_status(tg_user_id: str) -> str:
+    if not staff.is_admin(tg_user_id):
+        return "🔒 Admin only."
+    import guest_sim as gs
+    s = gs.get_state()
+    actives = gs._active_sim_rooms()
+    lines = [
+        f"🤖 *Guest sim*: {'🟢 RUNNING' if s.get('running') else '🔴 STOPPED'}",
+        f"Ticks: {s.get('ticks', 0)}",
+        f"Active synthetic guests: {len(actives)}",
+    ]
+    for r in actives[:10]:
+        lines.append(f"  • Room {r['room_number']} — {r.get('guest_name')}")
+    return "\n".join(lines)
+
+
 async def handle_moderate(tg_user_id: str, args: str) -> str:
     if not staff.is_admin(tg_user_id):
         return "🔒 Admin only."
@@ -921,4 +969,10 @@ async def dispatch(*, text: str, msg_from: dict, chat: dict) -> Optional[str]:
         return await handle_search_web(tg_user_id, args)
     if cmd in ("moderate", "review"):
         return await handle_moderate(tg_user_id, args)
+    if cmd in ("sim_start", "simstart", "sim_go"):
+        return await handle_sim_start(tg_user_id, args)
+    if cmd in ("sim_stop", "simstop", "sim_halt"):
+        return await handle_sim_stop(tg_user_id, args)
+    if cmd in ("sim_status", "simstatus", "sim"):
+        return await handle_sim_status(tg_user_id)
     return None  # unknown command — caller decides whether to ignore
