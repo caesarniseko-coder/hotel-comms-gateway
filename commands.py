@@ -446,27 +446,37 @@ async def handle_start_day(tg_user_id: str, args: str) -> str:
             f"/stop_day to halt or /world to inspect."
         )
 
-    # Fire-and-forget: world + sim + seeds in the background. Capture errors visibly.
-    async def _bg():
-        try:
-            await autonomy.seed_day(force=False)
-        except Exception as exc:
-            log.exception("seed_day failed: %s", exc)
-            from app import _record_error
-            _record_error("bg_seed_day", exc)
+    # Each subsystem starts independently so a slow one doesn't block the others.
+    from app import _record_error, _sim_handler as sim_handler
+
+    async def _start_world():
         try:
             await world.start_day()
         except Exception as exc:
             log.exception("world.start_day failed: %s", exc)
-            from app import _record_error
             _record_error("bg_world_start", exc)
+
+    async def _start_sim():
         try:
-            from app import _sim_handler
-            await gs.start_sim(_sim_handler)
+            await gs.start_sim(sim_handler)
         except Exception as exc:
             log.exception("guest_sim.start_sim failed: %s", exc)
-            from app import _record_error
             _record_error("bg_sim_start", exc)
+
+    async def _start_seeds():
+        try:
+            await autonomy.seed_day(force=False)
+        except Exception as exc:
+            log.exception("seed_day failed: %s", exc)
+            _record_error("bg_seed_day", exc)
+
+    _asyncio.create_task(_start_world())
+    _asyncio.create_task(_start_sim())
+    _asyncio.create_task(_start_seeds())
+
+    # Dead code below — _bg used to be defined here. Kept return below intact.
+    async def _bg():
+        return
 
     _asyncio.create_task(_bg())
     return (
